@@ -1,0 +1,3 @@
+[submodule "goodwe/goodwe"]
+	path = goodwe/goodwe
+	url = https://github.com/marcelblijleven/goodwe
