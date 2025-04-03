@@ -1,8 +1,10 @@
 #!/bin/python3
 
 import asyncio
+import os
 import sys
-sys.path.append('goodwe')
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(script_dir, 'goodwe'))
 import goodwe
 import configparser
 
