@@ -9,7 +9,7 @@ import goodwe
 import configparser
 
 config = configparser.ConfigParser()
-config.read('../conf/goodwe.conf')
+config.read(os.path.join(script_dir,'../conf/goodwe.conf'))
 
 async def get_runtime_data():
     ip_address = config['settings']['ip_address']

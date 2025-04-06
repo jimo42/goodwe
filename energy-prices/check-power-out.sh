@@ -8,16 +8,23 @@ PYSCRIPTS_DIR="$SCRIPT_DIR/../goodwe"
 THRESHOLD="20"
 
 enable_grid_output(){
-	if  `$PYSCRIPTS_DIR/goodwe_export_limit_read2.py | grep 1 >/dev/null` ; then
-		$PYSCRIPTS_DIR/goodwe_export_limit_disable.py
+	if [[ `$PYSCRIPTS_DIR/manage_goodwe.py read_export_limit | grep ENABLED | wc -l` -eq 1 ]] ; then 
+		$PYSCRIPTS_DIR/manage_goodwe.py export_limit_disable
 	fi
+#	if  `$PYSCRIPTS_DIR/goodwe_export_limit_read2.py | grep 1 >/dev/null` ; then
+#		$PYSCRIPTS_DIR/goodwe_export_limit_disable.py
+#	fi
 }
 
 disable_grid_output(){
-	if  `$PYSCRIPTS_DIR/goodwe_export_limit_read2.py | grep 0 >/dev/null` ; then
-		$PYSCRIPTS_DIR/goodwe_export_limit_enable.py
-		$PYSCRIPTS_DIR/goodwe_export_limit_set_to_zero.py
+	if [[ `$PYSCRIPTS_DIR/manage_goodwe.py read_export_limit | grep DISABLED | wc -l` -eq 1 ]] ; then
+		$PYSCRIPTS_DIR/manage_goodwe.py export_limit_enable
+		$PYSCRIPTS_DIR/manage_goodwe.py set_export_limit 0
 	fi
+#	if  `$PYSCRIPTS_DIR/goodwe_export_limit_read2.py | grep 0 >/dev/null` ; then
+#		$PYSCRIPTS_DIR/goodwe_export_limit_enable.py
+#		$PYSCRIPTS_DIR/goodwe_export_limit_set_to_zero.py
+#	fi
 }
 
 

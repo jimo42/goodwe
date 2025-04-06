@@ -1,4 +1,4 @@
 logs/
 conf/
-ceny-energie/*.html
+energy-prices/*.html
 *_v[0-9]*
