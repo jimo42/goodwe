@@ -16,6 +16,11 @@ get_file(){
 	if [ "$DESIRED_DATE" != "$DATE_READ" ] ; then echo -n " Dates don't match."; exit 1; fi
 	cat "$HTML" | pup 'table.report_table tbody tr json{}' | jq -r '.[] | [.children[0].text, .children[1].text] | join(";")' | grep ^[0-9] > $CSV
 	if [ ! -s "$DATE"".csv" ] ; then echo -n " CSV has zero size, will be re-attempted during next execution."; fi
+
+# check from second source
+	./getPricesFromENTSOE.py "$DESIRED_DATE"
+	diff $CSV "$DESIRED_DATE"_check.csv
+	if [ $? -ne 0 ] ; then echo -n " CSVs from two sources differ!"; else echo -n " CSVs from both sources are the same, deleting the check one."; rm "$DESIRED_DATE"_check.csv; fi
 }
 
 DATE=`date "+%Y-%m-%d" --date "today"`
