@@ -14,13 +14,14 @@ get_file(){
 #	DATE_READ=`cat $HTML | grep serverDataUrl | grep 'kratkodobe-trhy/elektrina/denni-trh/' | cut -d\= -f3 | cut -d\" -f1`
 	DATE_READ=`cat $HTML | grep serverDataUrl | grep 'kratkodobe-trhy/elektrina/denni-trh/' | cut -d\= -f3 | cut -d\" -f1 | cut -d\& -f1`
 	if [ "$DESIRED_DATE" != "$DATE_READ" ] ; then echo -n " Dates don't match."; exit 1; fi
-	cat "$HTML" | pup 'table.report_table tbody tr json{}' | jq -r '.[] | [.children[0].text, .children[1].text] | join(";")' | grep ^[0-9] > $CSV
+	cat "$HTML" | pup 'table.report_table tbody tr json{}' | jq -r '.[] | [.children[0].text, .children[1].text] | join(";")' | grep ^[0-9]  \
+	| while read L; do echo `echo $L | cut -d\- -f1`\;`echo $L | cut -d\; -f2`; done     > $CSV
 	if [ ! -s "$DATE"".csv" ] ; then echo -n " CSV has zero size, will be re-attempted during next execution."; fi
 
 # check from second source
 	./getPricesFromENTSOE.py "$DESIRED_DATE"
 	diff $CSV "$DESIRED_DATE"_check.csv
-	if [ $? -ne 0 ] ; then echo -n " CSVs from two sources differ!"; else echo -n " CSVs from both sources are the same, deleting the check one."; rm "$DESIRED_DATE"_check.csv; fi
+	if [ $? -ne 0 ] ; then echo -n " CSVs from two sources differ!"; else echo " CSVs from both sources are the same, deleting the check one."; rm "$DESIRED_DATE"_check.csv; fi
 }
 
 DATE=`date "+%Y-%m-%d" --date "today"`

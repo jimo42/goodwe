@@ -29,8 +29,8 @@ disable_grid_output(){
 
 
 DATE_NOW=$(date "+%Y-%m-%d")
-HOUR_NOW=$(date +"%k" | tr -d \  )
-[[ $HOUR_NOW -eq 0 ]] && HOUR_NOW=24
+HOUR_NOW=$(date +"%k:%M" | tr -d \  )
+#[[ $HOUR_NOW -eq 0 ]] && HOUR_NOW=24
 
 PRICE_NOW=$(cat "$DATE_NOW".csv | grep ^"$HOUR_NOW"';' | cut -d\; -f2 | tr \, \. )
 

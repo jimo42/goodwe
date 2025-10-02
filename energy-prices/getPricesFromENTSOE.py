@@ -68,14 +68,18 @@ for point in root.findall(".//{*}Point"):
         price_str = f"{price_float:.2f}".replace(".", ",")
         prices[position] = price_str
 
-# Export to CSV (fill missing hours by previous value, in line with entso-e instructions)
+# Export to CSV (fill missing slots by previous value, in line with entso-e instructions)
 out_file = f"{local_date.date()}_check.csv"
 with open(out_file, "w", encoding="utf-8") as f:
     previous = ""
-    for hour in range(1, 25):
-        value = prices.get(hour, previous)
-        f.write(f"{hour};{value}\n")
-        previous = value  # store for possible use in next hour
+    for slot in range(1, 97):  # 96 quarter-hours
+        value = prices.get(slot, previous)
+        # vypočítáme čas začátku slotu
+        minutes = (slot - 1) * 15
+        hh = minutes // 60
+        mm = minutes % 60
+        f.write(f"{hh:02d}:{mm:02d};{value}\n")
+        previous = value
 
 print(f"Done: {out_file}")
 
