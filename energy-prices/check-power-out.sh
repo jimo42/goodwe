@@ -55,7 +55,12 @@ PRICE_NOW=$(cat "$PRICES" | grep ^"$HOUR_NOW"';' | cut -d\; -f2 | tr \, \. | tr 
 
 echo -n "`date` - "
 
-if (( $(echo "$PRICE_NOW < $THRESHOLD" | bc -l) )); then
+COMPARISON=$(echo "$PRICE_NOW < $THRESHOLD" | bc -l) || {
+    echo "Price comparison failed, exiting."
+    exit 1
+}
+
+if [[ "$COMPARISON" == "1" ]]; then
 	echo "Current price $PRICE_NOW is lower than threshold, we should turn off the output to grid""$NOTIF""."
 	disable_grid_output
 else

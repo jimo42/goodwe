@@ -1,0 +1,54 @@
+{
+  "generated_at": "2026-07-18T18:01:42.702579",
+  "records_processed": 25561,
+  "archives_processed": [],
+  "night_load_by_month": {
+    "2026-07": {
+      "n": 4669,
+      "median_w": 422.0,
+      "p25_w": 338.0,
+      "p75_w": 587.0,
+      "min_w": -95.0,
+      "max_w": 3165.0
+    }
+  },
+  "pv_window_by_month": {
+    "2026-07": {
+      "median_pv_start": "05:37",
+      "n_days_first": 18,
+      "median_pv_end": "20:22",
+      "n_days_last": 18
+    }
+  },
+  "price_stats": {
+    "n_days_analyzed": 242,
+    "n_slots_total": 23233,
+    "mean_eur_mwh": 105.34,
+    "median_eur_mwh": 106.4,
+    "p10_eur_mwh": 46.02,
+    "p25_eur_mwh": 86.02,
+    "p40_eur_mwh": 99.0,
+    "p60_eur_mwh": 114.79,
+    "p75_eur_mwh": 130.3,
+    "p90_eur_mwh": 156.47,
+    "min_eur_mwh": -500.0,
+    "max_eur_mwh": 507.15,
+    "pct_slots_negative": 3.01,
+    "pct_slots_extreme_ge250": 0.93,
+    "monthly_avg_eur_mwh": {
+      "2025-10": 95.62,
+      "2025-11": 111.5,
+      "2025-12": 107.02,
+      "2026-01": 130.92,
+      "2026-02": 107.4,
+      "2026-03": 109.92,
+      "2026-04": 81.82,
+      "2026-05": 98.53,
+      "2026-06": 82.24
+    }
+  },
+  "weather_forecast_accuracy": {
+    "n_days_compared": 0,
+    "samples": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-07-18T20:11:46.412467",
+  "n_transitions_total": 76603,
+  "n_phase_transitions_matched_with_stats": 88,
+  "n_phase_transitions_unmatched": 19372,
+  "power_jump_on_phase_activation_w": {
+    "1": {
+      "n": 0,
+      "note": "malo vzorku"
+    },
+    "2": {
+      "n": 0,
+      "note": "malo vzorku"
+    },
+    "3": {
+      "n": 0,
+      "note": "malo vzorku"
+    }
+  },
+  "power_drop_on_phase_deactivation_w": {
+    "1": {
+      "n": 29,
+      "median_w": 116.0,
+      "p25_w": 16.0,
+      "p75_w": 1458.0,
+      "min_w": -4245.0,
+      "max_w": 6444.0
+    },
+    "2": {
+      "n": 31,
+      "median_w": 102.0,
+      "p25_w": 13.0,
+      "p75_w": 2099.0,
+      "min_w": -2020.0,
+      "max_w": 2298.0
+    },
+    "3": {
+      "n": 28,
+      "median_w": 88.5,
+      "p25_w": -17.0,
+      "p75_w": 1985.0,
+      "min_w": -93.0,
+      "max_w": 4311.0
+    }
+  }
+}
