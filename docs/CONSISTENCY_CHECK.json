@@ -1,0 +1,29 @@
+{
+  "version": "10-final",
+  "yaml_valid": true,
+  "critical_values": {
+    "eur_czk": 24.6,
+    "battery_cycle_cost_eur_mwh": 50.0,
+    "battery_model": "all_in_including_efficiency",
+    "extra_margin_eur_mwh": 0.0,
+    "gas_heat_value_eur_mwh": 100.0,
+    "battery_capacity_kwh": 14.8,
+    "battery_power_kw": 7.5,
+    "pool_windows": [
+      "09:30-12:30",
+      "13:30-16:30"
+    ],
+    "ev_phase": "L1",
+    "ev_power_kw": 3.01,
+    "ev_planning_power_kw": 2.75
+  },
+  "derived": {
+    "fixed_import_eur_mwh": 85.3280487804878,
+    "export_fee_eur_mwh": 15.853658536585366,
+    "import_zero_spot_eur_mwh": -85.3280487804878,
+    "self_use_spot_delta_eur_mwh": 41.32231404958678,
+    "grid_export_formula_constant": 169.10059756097561,
+    "gas_grid_break_even_spot_eur_mwh": -2.683420681314246,
+    "gas_pv_export_break_even_spot_eur_mwh": 115.85365853658537
+  }
+}
