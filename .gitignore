@@ -68,3 +68,7 @@ Thumbs.db
 *.swp
 *.swo
 .vscode/
+
+# Local utility scripts and local-only docs
+bin/
+WHATSAPP_AUTOMATION.md

@@ -1,32 +1,29 @@
 # goodwe
-GoodWe automatization from linux shell
 
-Here I am sharing my scripts for managing a fotovoltaic power plant I have at home. 
-Might be doable with something like Home Assistant, but I thought I'll give it a try and write my own, lightweigt version.
-Feel free to reuse or suggest improvement.
+Automation for a home photovoltaic system with a GoodWe inverter, battery storage and controlled electrical loads.
 
+The project started as a small set of Linux shell scripts and was later rebuilt into a smarter Python-based planner/executor architecture.
 
-Components involved:
-- GoodWe invertor (3-phase, 10 kWp)
-- Pylontech batteries
-- Network relay Web_Relay_Con V2.0 HW-584 to manage water heater
+## What I have
 
-Used git projects:
-- https://github.com/marcelblijleven/goodwe - library to communicate with GoodWe invertors
-- https://github.com/nielsonm236/NetMod-ServerApp - much better firmware for the network relay than the vendor's original one
+- GoodWe inverter monitoring and control.
+- Battery scheduling through GoodWe ECO modes.
+- 48-hour planning horizon with 15-minute resolution.
+- Electricity price input used for import/export and charging decisions.
+- Weather forecast input used for PV-aware planning.
+- MILP-based planner for battery, boiler and selected flexible loads.
+- Dynamic executor that applies the current plan every few minutes.
+- Water heater control through a network relay with read-back checks.
+- Runtime safety gates, dry-run support, state files and failure counters.
+- Basic request handling for ad-hoc EV charging, boiler heating and additional loads.
+- Daily/status reporting and operational alerts.
+- Hermetic manual test suite for planner, executor, device adapters and models.
 
+## What I'd like to have
 
-The main idea I have is to have a "state vector" with various values stored in a file, and then once in a while (reasonable frequency seems to be 5 minutes) adjust the behaviour based on past and new values.
+- Nothing specific planned at the moment.
 
-What I have:
-- Read electricity prices from web, disable output to grid for hours where price is <20 Euro/MWh (which is approx. a price where in Czech Rep. becomes selling of the energy non-profitable)
-- Enable 1/2/3 phases (2 kW each) of water heater using the LAN relay - currently, it's evaluated every 5 minutes and within fixed hours (cron */5 11-17 * * *), and the amount of phases is based on SOC thresholds (how much is the house battery charged)
-- Using the relay to run circulation pump every 20 minutes for 3 minutes
-Mind we have also gas water heater. The electrical one is in series in front of the gas one, so if the water is completely heated or pre-heated by the electric one, it then saves the gas costs. For ~6 months of the year, the gas one can be turned off completely.
+## Notes
 
-What I'd like to have:
-- The state vector mentioned above, with
-    - Reading weather forecast and estimating the remaining energy that will come within a day (ie. sun-hours) - to turn off the water heating in the afternoon/evening so it won't consume energy from battery
-    - More intelligent managing of the output to grid, considering the price of the energy and weather forcast (ie. "it will be sunny day, and the energy is expensive in the morning => output to grid, then around 12 price drops => charge battery, then heat water)
-- Some alerts/messages to mobile phone (is there some linux>whatsapp library?)
-- 
+- Local configuration, credentials, logs, runtime state, generated data and backups are intentionally excluded from Git.
+- Production-specific values should live in local ignored configuration files, not in committed source code.
