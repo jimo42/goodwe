@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v2.6 (2026-08-03): Pass confirmed boiler telemetry/ledger context into live
+  load detectors so relay-controlled boiler phases are not misclassified as
+  `unexpected_load` during active heating.
 - v2.5 (2026-08-03): Map HOLD to minimum ECO charge (-1 %) with 100 % SoC
   target instead of 0 % discharge. Real inverter test showed 0 % does not
   prevent self-use discharge, while charge 1 % approximates hold with about
@@ -56,7 +59,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "2.5"
+VERSION = "2.6"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -777,6 +780,8 @@ def detect_runtime_loads(
     cfg: Config,
     live_state: dict,
     current_slot: Optional[dict],
+    boiler_ledger: Optional[dict] = None,
+    telemetry_evidence: Optional[dict] = None,
     history_path: Path = STATE_HISTORY_PATH,
     detector_path: Path = DETECTED_LOADS_PATH,
     wallbox_state: Optional[dict] = None,
@@ -791,6 +796,8 @@ def detect_runtime_loads(
         recent_history=recent_history,
         previous_state=previous_state if isinstance(previous_state, dict) else {},
         wallbox_state=wallbox_state,
+        boiler_ledger=boiler_ledger if isinstance(boiler_ledger, dict) else {},
+        telemetry_evidence=telemetry_evidence if isinstance(telemetry_evidence, dict) else {},
     )
 
 
@@ -1038,6 +1045,8 @@ def run_executor(
         cfg=cfg,
         live_state=live_state,
         current_slot=current_slot,
+        boiler_ledger=ledger,
+        telemetry_evidence=telemetry_evidence,
         history_path=history_path,
         detector_path=DETECTED_LOADS_PATH,
         wallbox_state=wallbox_state,

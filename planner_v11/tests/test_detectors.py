@@ -87,6 +87,43 @@ def test_boiler_and_pool_are_subtracted_from_unexpected_load():
     assert detected["unexpected_load"]["kw"] == 0.0
 
 
+def test_confirmed_boiler_mask_is_preferred_over_live_heuristic():
+    cfg = _cfg()
+    now = datetime(2026, 8, 3, 11, 38, tzinfo=ZoneInfo(cfg.system.timezone))
+    live = {"house_consumption": 3791, "load_p1": 633, "load_p2": 2262, "load_p3": 642}
+    slot = _slot(now, additional_load_kwh=0.624 * 0.25, boiler_power_kw=6.0)
+    detected = detectors.detect_loads(
+        now=now,
+        cfg=cfg,
+        live_state=live,
+        current_slot=slot,
+        boiler_ledger={"current_mask": [True, True, True]},
+    )
+    assert detected["boiler"]["source"] == "ledger_confirmed_mask"
+    assert detected["boiler"]["detected_kw"] == 6.0
+    assert detected["boiler"]["phases"] == {"phase1": True, "phase2": True, "phase3": True}
+    assert detected["unexpected_load"]["active"] is False
+    assert detected["unexpected_load"]["kw"] < 0.5
+
+
+def test_confirmed_boiler_telemetry_is_preferred_over_ledger_mask():
+    cfg = _cfg()
+    now = datetime(2026, 8, 3, 12, 58, tzinfo=ZoneInfo(cfg.system.timezone))
+    live = {"house_consumption": 4886, "load_p1": 138, "load_p2": 2354, "load_p3": 2071}
+    detected = detectors.detect_loads(
+        now=now,
+        cfg=cfg,
+        live_state=live,
+        current_slot=_slot(now),
+        boiler_ledger={"current_mask": [True, True, True]},
+        telemetry_evidence={"confirmed_phase_delivery_kw": [0.0, 0.0, 1.961]},
+    )
+    assert detected["boiler"]["source"] == "telemetry_confirmed_phase_delivery"
+    assert detected["boiler"]["detected_kw"] == 1.961
+    assert detected["boiler"]["phase_kw"] == {"phase1": 0.0, "phase2": 0.0, "phase3": 1.961}
+    assert detected["boiler"]["phases"] == {"phase1": False, "phase2": False, "phase3": True}
+
+
 def test_unexpected_load_becomes_active_after_two_samples():
     cfg = _cfg()
     now = datetime(2026, 7, 22, 18, 0, tzinfo=ZoneInfo(cfg.system.timezone))

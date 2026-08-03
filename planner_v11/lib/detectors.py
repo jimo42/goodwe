@@ -1,9 +1,12 @@
 """
 Live load detectors for planner_v10 executor.
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 Changelog:
+- v1.4 (2026-08-03): Prefer confirmed boiler runtime context from executor
+  telemetry/ledger over pure phase-load heuristics, so active boiler phases are
+  not misclassified as `unexpected_load` during relay-controlled operation.
 - v1.3 (2026-07-25): Add a conservative sanity ceiling
   (`UNEXPECTED_SANITY_MAX_KW`) so an implausibly large single-phase reading
   (data glitch, not a real appliance) surfaces only as a diagnostic
@@ -36,7 +39,7 @@ from typing import Any, Optional
 from . import pool_model
 
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 EV_START_RESIDUAL_KW = 2.4
 EV_START_REQUIRED_SAMPLES_OF_5 = 3
@@ -145,19 +148,68 @@ def recent_unexpected_positive_samples(recent_history: list[dict]) -> int:
     return count
 
 
-def detect_boiler_kw(live_state: dict, cfg: Any) -> tuple[float, dict[str, bool]]:
+def _normalized_bool_triplet(values: Any) -> Optional[tuple[bool, bool, bool]]:
+    if not isinstance(values, list) or len(values) != 3:
+        return None
+    return tuple(bool(value) for value in values)
+
+
+def _normalized_kw_triplet(values: Any, *, phase_power_kw: float) -> Optional[tuple[float, float, float]]:
+    if not isinstance(values, list) or len(values) != 3:
+        return None
+    normalized: list[float] = []
+    for value in values:
+        try:
+            normalized.append(max(0.0, min(phase_power_kw, float(value))))
+        except (TypeError, ValueError):
+            return None
+    return tuple(normalized)
+
+
+def detect_boiler_kw(
+    live_state: dict,
+    cfg: Any,
+    *,
+    boiler_ledger: Optional[dict] = None,
+    telemetry_evidence: Optional[dict] = None,
+) -> tuple[float, dict[str, bool], dict[str, float], str]:
     per_phase: dict[str, bool] = {}
+    per_phase_kw: dict[str, float] = {}
     total = 0.0
     phase_power = float(cfg.boiler.phase_power_kw)
+
+    telemetry_triplet = _normalized_kw_triplet(
+        (telemetry_evidence or {}).get("confirmed_phase_delivery_kw") if isinstance(telemetry_evidence, dict) else None,
+        phase_power_kw=phase_power,
+    )
+    if telemetry_triplet is not None and sum(telemetry_triplet) > 0.05:
+        for idx, confirmed_kw in enumerate(telemetry_triplet, start=1):
+            phase_name = f"phase{idx}"
+            per_phase[phase_name] = confirmed_kw > 0.05
+            per_phase_kw[phase_name] = round(confirmed_kw, 3)
+        return round(sum(telemetry_triplet), 3), per_phase, per_phase_kw, "telemetry_confirmed_phase_delivery"
+
+    ledger_mask = _normalized_bool_triplet((boiler_ledger or {}).get("current_mask") if isinstance(boiler_ledger, dict) else None)
+    if ledger_mask is not None and any(ledger_mask):
+        for idx, enabled in enumerate(ledger_mask, start=1):
+            phase_name = f"phase{idx}"
+            per_phase[phase_name] = enabled
+            per_phase_kw[phase_name] = round(phase_power if enabled else 0.0, 3)
+            if enabled:
+                total += phase_power
+        return round(total, 3), per_phase, per_phase_kw, "ledger_confirmed_mask"
+
     for idx, phase in enumerate(PHASES, start=1):
         kw = phase_load_kw(live_state, phase)
         detected = False
         if kw is not None and phase_power > 0:
             detected = abs(kw - phase_power) <= BOILER_STEP_TOLERANCE_KW
-        per_phase[f"phase{idx}"] = detected
+        phase_name = f"phase{idx}"
+        per_phase[phase_name] = detected
+        per_phase_kw[phase_name] = round(phase_power if detected else 0.0, 3)
         if detected:
             total += phase_power
-    return total, per_phase
+    return round(total, 3), per_phase, per_phase_kw, "phase_load_heuristic"
 
 
 def detect_ev_kw(
@@ -280,7 +332,7 @@ def _phase_residuals(
     *,
     ev_kw: float,
     pool_kw: float,
-    boiler_phases: dict[str, bool],
+    boiler_phase_kw: dict[str, float],
 ) -> dict[str, Optional[float]]:
     residuals: dict[str, Optional[float]] = {}
     for idx, phase in enumerate(PHASES, start=1):
@@ -293,8 +345,7 @@ def _phase_residuals(
             residual -= ev_kw
         if phase == cfg.pool.flow_phase:
             residual -= min(pool_kw, float(cfg.pool.flow_power_kw))
-        if boiler_phases.get(f"phase{idx}"):
-            residual -= float(cfg.boiler.phase_power_kw)
+        residual -= float(boiler_phase_kw.get(f"phase{idx}", 0.0) or 0.0)
         residuals[phase] = round(max(0.0, residual), 3)
     return residuals
 
@@ -315,6 +366,8 @@ def detect_loads(
     recent_history: Optional[list[dict]] = None,
     previous_state: Optional[dict] = None,
     wallbox_state: Optional[dict] = None,
+    boiler_ledger: Optional[dict] = None,
+    telemetry_evidence: Optional[dict] = None,
 ) -> dict:
     """Return a serializable detector state for one executor run."""
     recent_history = recent_history or []
@@ -323,7 +376,12 @@ def detect_loads(
     house_kw = measured_house_kw(live_state)
     ev_kw, ev_evidence = detect_ev_kw(live_state, cfg, recent_history, wallbox_state)
     pool_kw, pool_evidence = detect_pool_kw(now, live_state, current_slot, cfg)
-    boiler_kw, boiler_phases = detect_boiler_kw(live_state, cfg)
+    boiler_kw, boiler_phases, boiler_phase_kw, boiler_source = detect_boiler_kw(
+        live_state,
+        cfg,
+        boiler_ledger=boiler_ledger,
+        telemetry_evidence=telemetry_evidence,
+    )
     announced_kw = slot_power_kw(current_slot, "additional_load_kwh", cfg.system.planning_step_minutes)
 
     if house_kw is None:
@@ -353,7 +411,7 @@ def detect_loads(
     previous_started_at = previous_unexpected.get("started_at") if isinstance(previous_unexpected, dict) else None
     started_at = previous_started_at if unexpected_active and previous_started_at else now.isoformat() if unexpected_active else None
 
-    residuals = _phase_residuals(live_state, cfg, ev_kw=ev_kw, pool_kw=pool_kw, boiler_phases=boiler_phases)
+    residuals = _phase_residuals(live_state, cfg, ev_kw=ev_kw, pool_kw=pool_kw, boiler_phase_kw=boiler_phase_kw)
 
     unannounced_ev_active = ev_kw > 0.0 and planned_ev_kw <= 0.05
     unannounced_ev_power_kw = (
@@ -400,6 +458,8 @@ def detect_loads(
             "detected_kw": round(boiler_kw, 3),
             "phase_power_kw": cfg.boiler.phase_power_kw,
             "phases": boiler_phases,
+            "phase_kw": boiler_phase_kw,
+            "source": boiler_source,
         },
         "announced_additional_load_kw": round(announced_kw, 3),
         "unexpected_load": {
