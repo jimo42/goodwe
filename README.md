@@ -4,6 +4,11 @@ Automation for a home photovoltaic system with a GoodWe inverter, battery storag
 
 The project started as a small set of Linux shell scripts and was later rebuilt into a smarter Python-based planner/executor architecture.
 
+## Used git projects
+
+- https://github.com/marcelblijleven/goodwe - library to communicate with GoodWe invertors
+- https://github.com/nielsonm236/NetMod-ServerApp - much better firmware for the network relay than the vendor's original one
+
 ## What I have
 
 - GoodWe inverter monitoring and control.
