@@ -5,6 +5,7 @@ terminální hodnotu a minimální forecast JSON kontrakt.
 """
 import copy
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -364,6 +365,7 @@ def test_send_planner_alerts_for_infeasible_ev_request():
             cfg=cfg,
             result=result,
             active_requests=active_requests,
+            requests_path=Path(tmp) / "requests.json",
             alert_state_path=Path(tmp) / "alert_state.json",
         )
     finally:
@@ -400,6 +402,7 @@ def test_send_planner_alerts_does_not_alert_deferred_far_horizon_ev():
             cfg=cfg,
             result=result,
             active_requests=active_requests,
+            requests_path=Path(tmp) / "requests.json",
             alert_state_path=Path(tmp) / "alert_state.json",
         )
     finally:
@@ -408,3 +411,187 @@ def test_send_planner_alerts_does_not_alert_deferred_far_horizon_ev():
 
     assert outcomes == []
     assert calls == []
+
+
+def _write_ev_request_with_baseline(path: Path, *, status: str = "active", baseline: str | None = "2026-08-05T11:00:00+02:00"):
+    item = {
+        "id": "ev-1",
+        "request_id": "ev-1",
+        "type": "ev_charge",
+        "status": status,
+    }
+    if baseline is not None:
+        item["ev_schedule_notification"] = {
+            "initial_notified_start": "2026-08-05T11:00:00+02:00",
+            "initial_notified_end": "2026-08-05T14:00:00+02:00",
+            "last_notified_start": baseline,
+            "last_notified_end": "2026-08-05T14:00:00+02:00",
+            "last_notified_at": "2026-08-04T00:00:00+02:00",
+        }
+    path.write_text(json.dumps({"schema_version": 10, "requests": [item]}), encoding="utf-8")
+
+
+def _ev_summary(
+    start: str | None,
+    end: str | None = "2026-08-05T14:00:00+02:00",
+    *,
+    feasible: bool = True,
+    request_id: str = "ev-1",
+):
+    return [{
+        "id": request_id,
+        "type": "ev_charge",
+        "recommendation": {
+            "feasible": feasible,
+            "recommended_start": start,
+            "expected_end": end,
+        },
+    }]
+
+
+def test_ev_schedule_change_ignores_59_minutes_and_alerts_exactly_60_both_directions():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-08-04T00:30:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v10_test_ev_shift_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        _write_ev_request_with_baseline(requests_path)
+        ignored = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:01:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        earlier = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:00:00+02:00", "2026-08-05T13:00:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        later = planner.send_ev_schedule_change_alerts(
+            now=now + timedelta(minutes=1),
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T11:00:00+02:00", "2026-08-05T14:00:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        metadata = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        assert ignored == []
+        assert earlier[0]["sent"] is True and earlier[0]["shift_minutes"] == 60.0
+        assert later[0]["sent"] is True and later[0]["shift_minutes"] == 60.0
+        assert "10:00–13:00" in calls[0] and "dříve" in calls[0]
+        assert "11:00–14:00" in calls[1] and "později" in calls[1]
+        assert metadata["initial_notified_start"] == "2026-08-05T11:00:00+02:00"
+        assert metadata["last_notified_start"] == "2026-08-05T11:00:00+02:00"
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_change_accumulates_small_shifts_against_last_announced_start():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-08-04T00:30:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v10_test_ev_shift_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        _write_ev_request_with_baseline(requests_path)
+        first = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:45:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        second = planner.send_ev_schedule_change_alerts(
+            now=now + timedelta(minutes=1),
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:00:00+02:00", "2026-08-05T13:00:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        metadata = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        assert first == []
+        assert second[0]["sent"] is True
+        assert len(calls) == 1
+        assert metadata["last_notified_start"] == "2026-08-05T10:00:00+02:00"
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_change_retains_baseline_on_send_failure_and_retries():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-08-04T00:30:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v10_test_ev_shift_")
+    original = planner.alerting.notify.send
+    send_results = iter((False, True))
+    planner.alerting.notify.send = lambda message, **kwargs: next(send_results)
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        _write_ev_request_with_baseline(requests_path)
+        failed = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:00:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        after_failure = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        retried = planner.send_ev_schedule_change_alerts(
+            now=now + timedelta(minutes=1),
+            cfg=cfg,
+            active_requests=_ev_summary("2026-08-05T10:00:00+02:00"),
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+        after_retry = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        assert failed[0]["reason"] == "send_failed"
+        assert after_failure["last_notified_start"] == "2026-08-05T11:00:00+02:00"
+        assert retried[0]["sent"] is True
+        assert after_retry["last_notified_start"] == "2026-08-05T10:00:00+02:00"
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_change_skips_missing_baseline_start_infeasible_and_inactive_request():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-08-04T00:30:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v10_test_ev_shift_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        cases = [
+            ("active", None, _ev_summary("2026-08-05T10:00:00+02:00")),
+            ("active", "2026-08-05T11:00:00+02:00", _ev_summary(None)),
+            ("active", "2026-08-05T11:00:00+02:00", _ev_summary("2026-08-05T10:00:00+02:00", feasible=False)),
+            ("active", "2026-08-05T11:00:00+02:00", _ev_summary("2026-08-05T10:00:00+02:00", request_id="ev-other")),
+            ("replaced", "2026-08-05T11:00:00+02:00", _ev_summary("2026-08-05T10:00:00+02:00")),
+        ]
+        for status, baseline, summary in cases:
+            _write_ev_request_with_baseline(requests_path, status=status, baseline=baseline)
+            assert planner.send_ev_schedule_change_alerts(
+                now=now,
+                cfg=cfg,
+                active_requests=summary,
+                requests_path=requests_path,
+                alert_state_path=alert_path,
+            ) == []
+        assert calls == []
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)

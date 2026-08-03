@@ -173,3 +173,81 @@ def test_active_requests_expires_past_deadline_and_end():
         assert "expired_at" in doc["requests"][0]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_notification_initializes_once_and_updates_with_compare_and_set():
+    tmp = _tmpdir()
+    try:
+        path = Path(tmp) / "requests.json"
+        request_store.store_request(
+            path,
+            {
+                "id": "ev-1",
+                "request_id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "deadline": "2026-08-05T20:00:00+02:00",
+            },
+            replace_existing_same_type=True,
+        )
+        initialized = request_store.initialize_ev_schedule_notification(
+            path,
+            "ev-1",
+            start="2026-08-05T11:00:00+02:00",
+            end="2026-08-05T14:00:00+02:00",
+            notified_at="2026-08-04T00:00:00+02:00",
+        )
+        duplicate = request_store.initialize_ev_schedule_notification(
+            path,
+            "ev-1",
+            start="2026-08-05T10:45:00+02:00",
+            end="2026-08-05T13:45:00+02:00",
+        )
+        mismatch = request_store.compare_and_set_ev_schedule_notification(
+            path,
+            "ev-1",
+            expected_last_start="2026-08-05T10:45:00+02:00",
+            new_start="2026-08-05T10:00:00+02:00",
+            new_end="2026-08-05T13:00:00+02:00",
+        )
+        updated = request_store.compare_and_set_ev_schedule_notification(
+            path,
+            "ev-1",
+            expected_last_start="2026-08-05T11:00:00+02:00",
+            new_start="2026-08-05T10:00:00+02:00",
+            new_end="2026-08-05T13:00:00+02:00",
+            notified_at="2026-08-04T01:00:00+02:00",
+        )
+        metadata = _read(path)["requests"][0]["ev_schedule_notification"]
+        assert initialized.updated is True
+        assert duplicate.reason == "already_initialized"
+        assert mismatch.reason == "compare_mismatch"
+        assert updated.updated is True
+        assert metadata["initial_notified_start"] == "2026-08-05T11:00:00+02:00"
+        assert metadata["initial_notified_end"] == "2026-08-05T14:00:00+02:00"
+        assert metadata["last_notified_start"] == "2026-08-05T10:00:00+02:00"
+        assert metadata["last_notified_end"] == "2026-08-05T13:00:00+02:00"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_notification_rejects_non_active_or_other_request():
+    tmp = _tmpdir()
+    try:
+        path = Path(tmp) / "requests.json"
+        path.write_text(json.dumps({
+            "requests": [
+                {"id": "old", "type": "ev_charge", "status": "replaced"},
+                {"id": "boiler", "type": "boiler_full", "status": "active"},
+            ]
+        }), encoding="utf-8")
+        for request_id in ("old", "boiler", "missing"):
+            result = request_store.initialize_ev_schedule_notification(
+                path,
+                request_id,
+                start="2026-08-05T11:00:00+02:00",
+                end="2026-08-05T14:00:00+02:00",
+            )
+            assert result.reason == "active_ev_not_found"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

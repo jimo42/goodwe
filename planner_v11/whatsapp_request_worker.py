@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 Changelog:
+- v1.5 (2026-08-04): Persist the initial EV schedule notification baseline
+  only after the correlated final WhatsApp reply succeeds.
 - v1.4 (2026-08-03): Wait for a fresh correlated on-demand planner result for
   EV, boiler and additional-load requests, retry transient planner failures,
   return final planning confirmations, and format user-facing times without
@@ -39,7 +41,7 @@ from typing import Any
 from lib import request_store
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 PLANNER_REPLAN_MAX_ATTEMPTS = 3
 PLANNER_REPLAN_RETRY_SECONDS = 5.0
@@ -86,6 +88,8 @@ class ProcessOutcome:
     success: bool
     reply: str | None
     deferred: bool = False
+    planning_request: dict[str, Any] | None = None
+    planning_forecast: dict[str, Any] | None = None
 
 
 def log(message: str, paths: WorkerPaths, *, verbose: bool = True) -> None:
@@ -618,6 +622,39 @@ def request_planning_reply(store_request: dict[str, Any], forecast: dict[str, An
     return "Požadavek je uložený a nový plán byl úspěšně přepočítán."
 
 
+def initialize_ev_notification_after_reply(
+    store_request: dict[str, Any],
+    forecast: dict[str, Any],
+    paths: WorkerPaths,
+    *,
+    notified_at: datetime | None = None,
+) -> request_store.EvScheduleNotificationResult | None:
+    """Persist the first feasible EV window after its final reply was delivered."""
+
+    if store_request.get("type") != "ev_charge":
+        return None
+    solver = forecast.get("solver", {})
+    if not isinstance(solver, dict) or solver.get("status") != "optimal":
+        return None
+    request_id = str(store_request.get("id") or store_request.get("request_id") or "")
+    planned = forecast_request(forecast, request_id)
+    recommendation = planned.get("recommendation", {}) if isinstance(planned, dict) else {}
+    if not isinstance(recommendation, dict) or recommendation.get("feasible") is not True:
+        return None
+    start = recommendation.get("recommended_start")
+    end = recommendation.get("expected_end")
+    if not isinstance(start, str) or not start or not isinstance(end, str) or not end:
+        return None
+    stamp = (notified_at or datetime.now().astimezone()).isoformat(timespec="seconds")
+    return request_store.initialize_ev_schedule_notification(
+        paths.requests_path,
+        request_id,
+        start=start,
+        end=end,
+        notified_at=stamp,
+    )
+
+
 def finish_request_planning(
     request_path: Path,
     paths: WorkerPaths,
@@ -645,6 +682,14 @@ def finish_request_planning(
         else:
             reply = request_planning_reply(store_request, forecast)
         reply_to_request(reply, request_path, paths)
+        if forecast is not None:
+            baseline_result = initialize_ev_notification_after_reply(store_request, forecast, paths)
+            if baseline_result is not None:
+                log(
+                    f"EV notification baseline {baseline_result.reason} for request {request_id}",
+                    paths,
+                    verbose=verbose,
+                )
     except RequestError as exc:
         reply = f"Finální potvrzení požadavku se nepodařilo vytvořit: {exc}"
         log(f"deferred request error for {request_path}: {exc}", paths, verbose=verbose)
@@ -812,7 +857,12 @@ def process_claimed(path: Path, paths: WorkerPaths, *, verbose: bool = True) -> 
             f"{ok_text} Mimořádný přepočet se nyní nepodařilo potvrdit ani po opakování; "
             "požadavek zůstává aktivní pro další běh planneru.",
         )
-    return ProcessOutcome(True, request_planning_reply(store_request, forecast))
+    return ProcessOutcome(
+        True,
+        request_planning_reply(store_request, forecast),
+        planning_request=store_request,
+        planning_forecast=forecast,
+    )
 
 
 def process_one(paths: WorkerPaths, *, verbose: bool = True) -> bool:
@@ -852,6 +902,19 @@ def process_one(paths: WorkerPaths, *, verbose: bool = True) -> bool:
         log(f"reply failed for {claimed}: {exc}\n{traceback.format_exc()}", paths, verbose=verbose)
         move_request(claimed, paths.spool_dir, "failed")
         return True
+
+    if outcome.planning_request is not None and outcome.planning_forecast is not None:
+        baseline_result = initialize_ev_notification_after_reply(
+            outcome.planning_request,
+            outcome.planning_forecast,
+            paths,
+        )
+        if baseline_result is not None:
+            log(
+                f"EV notification baseline {baseline_result.reason} for request {baseline_result.request_id}",
+                paths,
+                verbose=verbose,
+            )
 
     move_request(claimed, paths.spool_dir, "done")
     log(f"completed {claimed.name} success={outcome.success}", paths, verbose=verbose)

@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-03 23:01 CEST**
+Aktualizováno: **2026-08-04 01:09 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -76,9 +76,11 @@ Jsou stále užitečné jako architektonické/spec podklady, ale **aktivní runt
 - Aktivní produkce: `/home/automatization/goodwe/planner_v11/`.
 - Lokální staging: `c:\$jimo\sejfik\remote_staging\planner_v11\`.
 - Aktuální ověřené verze:
-  - `planner.py 1.4`, `MODEL_VERSION="11-planner-v1"`
+  - `planner.py 1.5`, `MODEL_VERSION="11-planner-v1"`
   - `executor.py 2.6`, `MODEL_VERSION="11-executor-v1"`
-  - `whatsapp_request_worker.py 1.4`
+  - `whatsapp_request_worker.py 1.5`
+  - `lib/request_store.py 1.3`
+  - `lib/alerting.py 1.1`
   - `lib/relay.py 1.1`
   - `lib/telemetry.py 1.1`
   - `lib/boiler_state.py 1.1`
@@ -487,3 +489,42 @@ zůstává aktivní pro další planner run.
   timeframe v `requests`, user-facing time formatting a souvislost EV okna.
 - Validace nevložila syntetický request do produkčního spoolu ani neměnila
   produkční `state/requests.json`.
+
+## 14. WhatsApp alert při významné změně EV startu (2026-08-04 01:09 CEST)
+
+### Nasazené chování
+
+- `planner_v11/planner.py VERSION="1.5"` porovnává doporučený EV start s
+  `ev_schedule_notification.last_notified_start` stejného aktivního
+  `request_id`.
+- Posun 0–59 minut včetně nic neposílá a referenci nemění. Absolutní posun
+  alespoň 60 minut v obou směrech pošle přes `notify_admins.sh` celé nové okno
+  `recommended_start–expected_end`.
+- Po úspěšném odeslání se atomicky aktualizují pouze `last_notified_*`;
+  `initial_notified_*` zůstávají auditně neměnné. Při chybě odeslání se
+  reference nemění a další planner run provede retry.
+- Malé změny se kumulují proti poslední oznámené referenci. Bez startu,
+  infeasible doporučení nebo u expired/replaced/cancelled requestu se změnový
+  alert neposílá; existující infeasibility alert zůstává.
+- `whatsapp_request_worker.py VERSION="1.5"` zakládá baseline teprve po úspěšné
+  finální korelované EV odpovědi.
+- `lib/request_store.py VERSION="1.3"` a `lib/alerting.py VERSION="1.1"`
+  serializují Linux `flock` kritické sekce. Překrývající se planner runy tak
+  nemohou současně odeslat stejnou změnu a replace/cancel nemůže proběhnout
+  mezi poslední kontrolou requestu a aktualizací reference.
+
+### Ověření, migrace a rollback
+
+- Izolovaný candidate: `compileall` + full suite **193/193 passed**.
+- Aktivní produkční strom po instalaci: `compileall` + full suite
+  **193/193 passed**.
+- Produkční aktivní EV `request_id=28dfcf69-6034-4a0e-bc57-7d09ec6ed98a`
+  byl bez odeslání zprávy inicializován z přesně matching feasible forecastu na
+  baseline `2026-08-04T11:00:00+02:00`.
+- Backup před nasazením:
+  `/home/automatization/goodwe/backups/planner_v11_ev_schedule_alert_20260804_010914/`.
+- Testy kryjí 59 minut, přesně 60 minut, oba směry, kumulaci malých změn,
+  update po úspěchu, zachování reference a retry po chybě, chybějící baseline,
+  infeasible/no-start, jiný a neaktivní request, neměnnost initial metadat a
+  zápis prvního baseline pouze po úspěšné odpovědi.
+- Nebyl vložen syntetický produkční spool request ani ručně spuštěn executor.

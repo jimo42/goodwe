@@ -63,6 +63,13 @@ def _make_reply_script(root: Path) -> Path:
     return script
 
 
+def _make_failing_reply_script(root: Path) -> Path:
+    script = root / "reply-fail.py"
+    script.write_text("#!/usr/bin/env python3\nraise SystemExit(1)\n", encoding="utf-8")
+    os.chmod(script, 0o755)
+    return script
+
+
 def _make_status_script(root: Path) -> Path:
     script = root / "show_status.py"
     script.write_text("print('STATUS OK')\n", encoding="utf-8")
@@ -553,4 +560,57 @@ def test_new_request_gets_immediate_ack_and_defers_final_planning():
         assert len(calls) == 1
     finally:
         worker.start_async_request_planning = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_baseline_is_persisted_only_after_successful_final_reply():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_planner_script(root),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        _write_request(spool, "ev-success.json", "charge car;10kWh;2026-07-23T08:30:00+02:00", "ev-success")
+        assert worker.process_one(paths, verbose=False) is True
+        item = json.loads(paths.requests_path.read_text(encoding="utf-8"))["requests"][0]
+        metadata = item["ev_schedule_notification"]
+        assert metadata["initial_notified_start"] == "2026-07-23T01:00:00+02:00"
+        assert metadata["last_notified_end"] == "2026-07-23T05:00:00+02:00"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_baseline_is_not_persisted_when_final_reply_fails():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_failing_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_planner_script(root),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        _write_request(spool, "ev-fail.json", "charge car;10kWh;2026-07-23T08:30:00+02:00", "ev-fail")
+        assert worker.process_one(paths, verbose=False) is True
+        item = json.loads(paths.requests_path.read_text(encoding="utf-8"))["requests"][0]
+        assert "ev_schedule_notification" not in item
+        assert (spool / "failed" / "ev-fail.json").exists()
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)

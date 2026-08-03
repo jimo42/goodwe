@@ -1,9 +1,11 @@
 """
 Deduplicated admin alerts for planner_v10.
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 Changelog:
+- v1.1 (2026-08-04): Serialize deduplication decisions and state updates so
+  overlapping planner runs cannot send the same alert concurrently.
 - v1.0 (2026-07-24): Add JSON-backed deduplication over `notify_admins.sh`
   for fault alerts and daily report messages.
 
@@ -18,14 +20,20 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - local Windows test compatibility.
+    fcntl = None
+
 from . import notify
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 PLANNER_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = PLANNER_DIR / "state"
 DEFAULT_ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
@@ -71,6 +79,22 @@ def atomic_write_json(path: Path, payload: dict) -> None:
             pass
 
 
+@contextmanager
+def alert_state_lock(path: Path):
+    """Serialize one alert-state decision, external send and persistence."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def repeat_minutes_from_cfg(cfg: Any, default: float = 60.0) -> float:
     try:
         return float(cfg.alerts.fault_repeat_minutes)
@@ -95,30 +119,31 @@ def notify_once(
     repeat = repeat_minutes if repeat_minutes is not None else repeat_minutes_from_cfg(cfg)
     repeat_delta = timedelta(minutes=max(0.0, float(repeat)))
 
-    state = read_state(state_path)
-    alerts = state.setdefault("alerts", {})
-    existing = alerts.get(key) if isinstance(alerts.get(key), dict) else {}
-    last_sent = _parse_dt(existing.get("last_sent_at")) if isinstance(existing, dict) else None
-    if (
-        not force
-        and last_sent is not None
-        and now - last_sent < repeat_delta
-        and existing.get("last_message") == message
-    ):
-        return {"sent": False, "reason": "deduplicated", "key": key, "last_sent_at": last_sent.isoformat()}
+    with alert_state_lock(state_path):
+        state = read_state(state_path)
+        alerts = state.setdefault("alerts", {})
+        existing = alerts.get(key) if isinstance(alerts.get(key), dict) else {}
+        last_sent = _parse_dt(existing.get("last_sent_at")) if isinstance(existing, dict) else None
+        if (
+            not force
+            and last_sent is not None
+            and now - last_sent < repeat_delta
+            and existing.get("last_message") == message
+        ):
+            return {"sent": False, "reason": "deduplicated", "key": key, "last_sent_at": last_sent.isoformat()}
 
-    ok = notify.send(message, notify_script=notify_script)
-    alerts[key] = {
-        "last_seen_at": now.isoformat(),
-        "last_message": message,
-        "last_send_ok": ok,
-        "send_count": int(existing.get("send_count", 0) if isinstance(existing, dict) else 0) + (1 if ok else 0),
-    }
-    if ok:
-        alerts[key]["last_sent_at"] = now.isoformat()
-    elif isinstance(existing, dict) and existing.get("last_sent_at"):
-        alerts[key]["last_sent_at"] = existing.get("last_sent_at")
-    atomic_write_json(state_path, state)
+        ok = notify.send(message, notify_script=notify_script)
+        alerts[key] = {
+            "last_seen_at": now.isoformat(),
+            "last_message": message,
+            "last_send_ok": ok,
+            "send_count": int(existing.get("send_count", 0) if isinstance(existing, dict) else 0) + (1 if ok else 0),
+        }
+        if ok:
+            alerts[key]["last_sent_at"] = now.isoformat()
+        elif isinstance(existing, dict) and existing.get("last_sent_at"):
+            alerts[key]["last_sent_at"] = existing.get("last_sent_at")
+        atomic_write_json(state_path, state)
     return {"sent": ok, "reason": "sent" if ok else "send_failed", "key": key}
 
 

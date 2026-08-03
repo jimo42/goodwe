@@ -26,9 +26,11 @@ Vědomá zjednodušení pro v1:
   - Neprobíhá příprava/zápis near-term ECO akcí; to přijde až s executorem a
     adaptéry s read-back verifikací.
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 Changelog:
+- v1.5 (2026-08-04): Notify significant EV recommendation start shifts
+  against the last successfully announced request-scoped baseline.
 - v1.4 (2026-08-02): Production v11 release paired with the v11 executor;
   the planner remains read-only with respect to devices.
 - v1.3 (2026-07-27): Mark past active requests as expired before using them
@@ -59,9 +61,10 @@ from lib import alerting, boiler_model, boiler_state, economics, ev_model, load_
 from lib.config import Config, ConfigError, load_config
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 MODEL_VERSION = "11-planner-v1"
 SCHEMA_VERSION = 10
+EV_SCHEDULE_CHANGE_MINUTES = 60.0
 
 PLANNER_DIR = Path(__file__).resolve().parent
 STATE_DIR = PLANNER_DIR / "state"
@@ -906,12 +909,78 @@ def _is_deferred_far_horizon_request(req: dict) -> bool:
     return bool(req.get("deadline_outside_current_horizon")) and "mimo aktuální 48h horizont" in reason
 
 
+def _format_ev_alert_interval(start: datetime, end: datetime) -> str:
+    if start.date() == end.date():
+        return f"{start.day}. {start.month}. {start.year} {start:%H:%M}–{end:%H:%M}"
+    return f"{start.day}. {start.month}. {start.year} {start:%H:%M} až {end.day}. {end.month}. {end.year} {end:%H:%M}"
+
+
+def send_ev_schedule_change_alerts(
+    *,
+    now: datetime,
+    cfg: Config,
+    active_requests: list[dict],
+    requests_path: Path = REQUESTS_PATH,
+    alert_state_path: Path = ALERT_STATE_PATH,
+) -> list[dict]:
+    """Notify when an active EV start moves by at least the business threshold."""
+
+    outcomes: list[dict] = []
+    for req in active_requests:
+        if not isinstance(req, dict) or req.get("type") != "ev_charge":
+            continue
+        request_id = _request_alert_key(req)
+        rec = req.get("recommendation", {}) if isinstance(req.get("recommendation"), dict) else {}
+        if (
+            rec.get("feasible") is not True
+            or not rec.get("recommended_start")
+            or not rec.get("expected_end")
+        ):
+            continue
+        try:
+            new_start = parse_iso_datetime(str(rec["recommended_start"]), ZoneInfo(cfg.system.timezone))
+            new_end = parse_iso_datetime(str(rec["expected_end"]), ZoneInfo(cfg.system.timezone))
+        except (TypeError, ValueError):
+            continue
+        with request_store.active_ev_schedule_notification(requests_path, request_id) as notification:
+            if notification is None:
+                continue
+            previous_start = parse_iso_datetime(notification.last_notified_start, ZoneInfo(cfg.system.timezone))
+            shift_minutes = abs((new_start - previous_start).total_seconds()) / 60.0
+            if shift_minutes < EV_SCHEDULE_CHANGE_MINUTES:
+                continue
+            direction = "později" if new_start > previous_start else "dříve"
+            message = (
+                "FVE INFO: doporučený plán nabíjení auta se významně změnil. "
+                f"Nové okno: {_format_ev_alert_interval(new_start, new_end)}. "
+                f"Předchozí oznámený start byl {previous_start:%H:%M}; "
+                f"nový start je o {shift_minutes:.0f} minut {direction}."
+            )
+            outcome = alerting.notify_once(
+                f"planner.ev_schedule_changed.{request_id}", message,
+                cfg=cfg, state_path=alert_state_path, now=now,
+            )
+            if outcome.get("sent") is True or outcome.get("reason") == "deduplicated":
+                update = request_store.compare_and_set_ev_schedule_notification(
+                    requests_path, request_id,
+                    expected_last_start=notification.last_notified_start,
+                    new_start=str(rec["recommended_start"]), new_end=str(rec["expected_end"]),
+                    notified_at=now.isoformat(timespec="seconds"), lock_held=True,
+                )
+                outcome["baseline_updated"] = update.updated
+                outcome["baseline_update_reason"] = update.reason
+                outcome["shift_minutes"] = shift_minutes
+            outcomes.append(outcome)
+    return outcomes
+
+
 def send_planner_alerts(
     *,
     now: datetime,
     cfg: Config,
     result: optimizer.OptimizerResult,
     active_requests: list[dict],
+    requests_path: Path = REQUESTS_PATH,
     alert_state_path: Path = ALERT_STATE_PATH,
 ) -> list[dict]:
     """Send deduplicated planner-side alerts via notify_admins.sh."""
@@ -958,6 +1027,14 @@ def send_planner_alerts(
                 state_path=alert_state_path,
                 now=now,
             ))
+
+    outcomes.extend(send_ev_schedule_change_alerts(
+        now=now,
+        cfg=cfg,
+        active_requests=active_requests,
+        requests_path=requests_path,
+        alert_state_path=alert_state_path,
+    ))
 
     return outcomes
 
