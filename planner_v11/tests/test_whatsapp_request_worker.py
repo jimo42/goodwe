@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -68,6 +69,39 @@ def _make_status_script(root: Path) -> Path:
     return script
 
 
+def _make_planner_script(root: Path, *, fail_first: bool = False, correlated: bool = True) -> Path:
+    script = root / "planner.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "from datetime import datetime\n"
+        f"root = pathlib.Path({str(root)!r})\n"
+        "count_path = root / 'planner-count.txt'\n"
+        "count = int(count_path.read_text() or '0') + 1 if count_path.exists() else 1\n"
+        "count_path.write_text(str(count), encoding='utf-8')\n"
+        f"if {fail_first!r} and count == 1:\n"
+        "    raise SystemExit(3)\n"
+        "request_doc = json.loads((root / 'requests.json').read_text(encoding='utf-8'))\n"
+        "request = [item for item in request_doc['requests'] if item.get('status') == 'active'][-1]\n"
+        f"request_id = request.get('id') if {correlated!r} else 'different-request'\n"
+        "summary = {'id': request_id, 'type': request.get('type')}\n"
+        "if request.get('type') == 'ev_charge':\n"
+        "    summary.update({'required_ac_kwh': request.get('required_ac_kwh'), 'deadline': request.get('deadline'), "
+        "'recommendation': {'feasible': True, 'recommended_start': '2026-07-23T01:00:00+02:00', "
+        "'expected_end': '2026-07-23T05:00:00+02:00', 'latest_safe_start': '2026-07-23T04:15:00+02:00', "
+        "'expected_delivered_kwh': request.get('required_ac_kwh'), 'reason': 'test'}})\n"
+        "forecast = {'generated_at': datetime.now().astimezone().isoformat(), "
+        "'solver': {'status': 'optimal'}, 'active_requests': [summary], "
+        "'optimizer_slacks': {'ev_unserved_kwh': 0.0, 'boiler_hard_unserved_kwh': 0.0}, "
+        "'slots': [{'slot_start': '2026-07-23T00:00:00+02:00'}, {'slot_start': '2026-07-23T13:00:00+02:00'}]}\n"
+        "(root / 'forecast_48h.json').write_text(json.dumps(forecast), encoding='utf-8')\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    os.chmod(script, 0o755)
+    return script
+
+
 def _paths(root: Path, spool: Path) -> worker.WorkerPaths:
     return worker.WorkerPaths(
         spool_dir=spool,
@@ -79,6 +113,7 @@ def _paths(root: Path, spool: Path) -> worker.WorkerPaths:
         planner_log_path=root / "planner.log",
         forecast_path=root / "forecast_48h.json",
         async_status=False,
+        async_planning=False,
     )
 
 
@@ -244,11 +279,31 @@ def test_requests_command_lists_numbered_active_requests():
             }),
             encoding="utf-8",
         )
+        paths.forecast_path.write_text(
+            json.dumps({
+                "active_requests": [
+                    {
+                        "id": "ev-1",
+                        "type": "ev_charge",
+                        "recommendation": {
+                            "feasible": True,
+                            "recommended_start": "2099-07-24T11:00:00+02:00",
+                            "expected_end": "2099-07-24T14:45:00+02:00",
+                        },
+                    }
+                ],
+                "slots": [],
+            }),
+            encoding="utf-8",
+        )
         _write_request(spool, "requests.json", "requests")
         assert worker.process_one(paths, verbose=False) is True
         reply = _reply_log(spool)
         assert "Aktivní požadavky" in reply
         assert "1. auto 5.0 kWh" in reply
+        assert "Nabíjení naplánovat na" in reply
+        assert "11:00–14:45" in reply
+        assert ":00+02:00" not in reply
         assert "cancel 1" in reply
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -317,4 +372,185 @@ def test_quiet_no_request_does_not_write_log_noise():
         assert worker.process_one(paths, verbose=False) is False
         assert not paths.log_path.exists()
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_user_datetime_format_includes_weekday_and_omits_seconds_timezone():
+    text = worker.format_user_datetime("2026-07-23T08:30:45+02:00")
+    assert text == "čtvrtek 23. 7. 2026 08:30"
+    assert ":45" not in text
+    assert "+02:00" not in text
+
+
+def test_ev_final_confirmation_contains_single_recommended_timeframe():
+    request = {
+        "id": "ev-1",
+        "type": "ev_charge",
+        "required_ac_kwh": 10.0,
+        "deadline": "2026-07-23T08:30:00+02:00",
+    }
+    forecast = {
+        "solver": {"status": "optimal"},
+        "active_requests": [{
+            "id": "ev-1",
+            "type": "ev_charge",
+            "recommendation": {
+                "feasible": True,
+                "recommended_start": "2026-07-23T01:00:00+02:00",
+                "expected_end": "2026-07-23T05:00:00+02:00",
+                "latest_safe_start": "2026-07-23T04:15:00+02:00",
+            },
+        }],
+    }
+    reply = worker.request_planning_reply(request, forecast)
+    assert "Nabíjení nastavte na čtvrtek 23. 7. 2026 01:00–05:00" in reply
+    assert "Nejpozdější bezpečný start je čtvrtek 23. 7. 2026 04:15" in reply
+    assert reply.count("Nabíjení nastavte na") == 1
+    assert "+02:00" not in reply
+
+
+def test_boiler_and_additional_load_final_confirmations_come_from_fresh_plan():
+    boiler = {
+        "id": "boiler-1",
+        "type": "boiler_full",
+        "deadline": "2026-07-23T08:30:00+02:00",
+    }
+    boiler_forecast = {
+        "solver": {"status": "optimal"},
+        "active_requests": [{"id": "boiler-1", "type": "boiler_full"}],
+        "optimizer_slacks": {"boiler_hard_unserved_kwh": 0.0},
+    }
+    assert "je zahrnutý v novém plánu" in worker.request_planning_reply(boiler, boiler_forecast)
+
+    load = {
+        "id": "load-1",
+        "type": "additional_load",
+        "power_kw": 2.5,
+        "start": "2026-07-23T10:00:00+02:00",
+        "end": "2026-07-23T12:30:00+02:00",
+    }
+    load_forecast = {
+        "solver": {"status": "optimal"},
+        "active_requests": [{"id": "load-1", "type": "additional_load"}],
+        "slots": [
+            {"slot_start": "2026-07-23T00:00:00+02:00"},
+            {"slot_start": "2026-07-23T23:45:00+02:00"},
+        ],
+    }
+    reply = worker.request_planning_reply(load, load_forecast)
+    assert "je zahrnutá v novém plánu" in reply
+    assert "10:00–12:30" in reply
+
+
+def test_replan_retries_transient_failure_and_requires_request_correlation():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_planner_script(root, fail_first=True),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        paths.requests_path.write_text(json.dumps({
+            "requests": [{
+                "id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 10.0,
+                "deadline": "2026-07-23T08:30:00+02:00",
+            }]
+        }), encoding="utf-8")
+        result = worker.run_planner_replan(
+            paths,
+            request_id="ev-1",
+            not_before=datetime.now().astimezone() - timedelta(seconds=1),
+            verbose=False,
+            max_attempts=2,
+            retry_seconds=0,
+        )
+        assert result is not None
+        assert (root / "planner-count.txt").read_text(encoding="utf-8") == "2"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_replan_rejects_fresh_but_uncorrelated_forecast():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_planner_script(root, correlated=False),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        paths.requests_path.write_text(json.dumps({
+            "requests": [{
+                "id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 10.0,
+                "deadline": "2026-07-23T08:30:00+02:00",
+            }]
+        }), encoding="utf-8")
+        result = worker.run_planner_replan(
+            paths,
+            request_id="ev-1",
+            not_before=datetime.now().astimezone() - timedelta(seconds=1),
+            verbose=False,
+            max_attempts=1,
+            retry_seconds=0,
+        )
+        assert result is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_request_gets_immediate_ack_and_defers_final_planning():
+    tmp = _tmpdir()
+    original = worker.start_async_request_planning
+    calls = []
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=root / "planner.py",
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=True,
+        )
+        _write_request(spool, "ev-async.json", "charge car;10kWh;2026-07-23T08:30:00+02:00", "ev-async")
+
+        def fake_start(path, worker_paths, *, not_before, verbose=True):
+            calls.append((path, worker_paths, not_before, verbose))
+
+        worker.start_async_request_planning = fake_start
+        assert worker.process_one(paths, verbose=False) is True
+        assert (spool / "processing" / "ev-async.json").exists()
+        assert not (spool / "done" / "ev-async.json").exists()
+        assert "Přepočítávám plán" in _reply_log(spool)
+        assert len(calls) == 1
+    finally:
+        worker.start_async_request_planning = original
         shutil.rmtree(tmp, ignore_errors=True)

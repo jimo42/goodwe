@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-03 02:06 CEST**  
+Aktualizováno: **2026-08-03 23:01 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -55,7 +55,7 @@ Skript má chytat výjimky, vypsat chybu a skončit `exit 0` při úspěchu nebo
 - Python na serveru: 3.13.5 systémově, bez venv; systém je PEP 668 `externally-managed`.
 - `scipy`, `numpy`, `PuLP 2.7.0` jsou nainstalované systémově a funkční.
 - `pytest` není nainstalovaný; testy spouštět přes `tests/run_manual.py`.
-- Pokud chybí jakékoli linuxové nebo pythonovské balíčky, **nikdy se je neznažit nainstalovat či obejít**. 
+- Pokud chybí jakékoli linuxové nebo pythonovské balíčky, **nikdy se je neznažit nainstalovat či obejít**.
   Místo toho si o instalaci uživatelovi.
 
 ### 3.2 Řídicí dokumenty
@@ -77,7 +77,8 @@ Jsou stále užitečné jako architektonické/spec podklady, ale **aktivní runt
 - Lokální staging: `c:\$jimo\sejfik\remote_staging\planner_v11\`.
 - Aktuální ověřené verze:
   - `planner.py 1.4`, `MODEL_VERSION="11-planner-v1"`
-  - `executor.py 2.5`, `MODEL_VERSION="11-executor-v1"`
+  - `executor.py 2.6`, `MODEL_VERSION="11-executor-v1"`
+  - `whatsapp_request_worker.py 1.4`
   - `lib/relay.py 1.1`
   - `lib/telemetry.py 1.1`
   - `lib/boiler_state.py 1.1`
@@ -329,6 +330,58 @@ Ověření:
 
 **Doporučená další kontrola pro navazujícího:** i po této opravě stojí za to nechat uživatele znovu potvrdit v UI/na displeji střídače, že se baterie během aktivního HOLD segmentu skutečně nevybíjí (mírné nabíjení cca desítek wattů je očekávané a v pořádku).
 
+### 8.6 Falešné alerty `neočekávaná zátěž` při běžícím bojleru - oprava detektoru
+
+Po prvním dni ostrého provozu uživatel nahlásil opakované WhatsApp alerty typu
+`FVE ALERT: neočekávaná zátěž ...`, které časově korelovaly s reálným během
+bojleru (např. 11:38, 11:43, 11:48, 11:53, 12:28, 12:38, 12:43 CEST dne
+2026-08-03).
+
+Root cause zjištěný z `state/state_history.jsonl` a kódu:
+
+- `executor.py` nejdřív zapsal/ověřil bojlerovou masku a aktualizoval ledger,
+  ale teprve potom volal `detectors.detect_loads()`.
+- `lib/detectors.py v1.3` pro odečet bojleru používal jen heuristiku nad
+  okamžitými `load_p1/2/3` a ignoroval již potvrzený runtime kontext bojleru.
+- V některých bězích tak detektor současně viděl v ledgeru potvrzený aktivní
+  bojler (`current_mask` / `confirmed_phase_delivery_kw`), ale přesto vyhodnotil
+  `boiler.detected_kw = 0` a zbytek spotřeby chybně zařadil do
+  `unexpected_load`.
+
+Oprava nasazená **2026-08-03 22:19 CEST**:
+
+- `planner_v11/executor.py` zvýšen na **v2.6**.
+- `planner_v11/lib/detectors.py` zvýšen na **v1.4**.
+- `detect_runtime_loads()` nyní předává do detektoru:
+  - potvrzený `boiler_ledger`,
+  - `telemetry_evidence`.
+- `detect_loads()` nyní pro bojler preferuje tento source of truth v pořadí:
+  1. `telemetry.confirmed_phase_delivery_kw`,
+  2. `ledger.current_mask`,
+  3. až potom fallback na původní heuristiku z `load_p1/2/3`.
+- Výstup detektoru nově uvádí i `boiler.source` a `boiler.phase_kw`, aby bylo
+  z runtime stavu vidět, z čeho byl bojlerový odečet odvozen.
+- Doplněny regresní testy do `tests/test_detectors.py` pro:
+  - preferenci confirmed ledger masky před heuristikou,
+  - preferenci confirmed telemetry před ledger maskou.
+
+Ověření:
+
+- Izolovaná candidate kopie `/tmp/planner_v11_detector_fix_candidate`:
+  `python3 -m compileall -q .` + `python3 tests/run_manual.py` →
+  **179/179 passed**.
+- Aktivní deployment po nasazení: `python3 -m compileall -q .` +
+  `python3 tests/run_manual.py` → **179/179 passed**.
+- Záloha původních produkčních souborů je na serveru v
+  `/home/automatization/goodwe/backups/planner_v11_detector_fix_20260803_221911/`.
+
+Doporučené provozní ověření po této opravě:
+
+- sledovat další den `state/runtime_state.json`, `state/state_history.jsonl` a
+  WhatsApp alerty,
+- ověřit, že během aktivních bojlerových masek už nevznikají falešné alerty
+  `executor.unexpected_load.*`, pokud nejde o skutečnou další zátěž.
+
 ## 9. WhatsApp/request/reporting stav
 
 
@@ -380,4 +433,57 @@ Dokumentace wrapperu je lokálně v `WHATSAPP_AUTOMATION.md`; číst ji jen při
 
 - Pozorovat produkční v11 logy/runtime po boiler redesignu.
 - Případné další změny business logiky dělat až po aktuálním auditu logů a přes výše uvedený script workflow.
-- Po každém dokončeném úkolu aktualizovat handoff a následně provést serverový `git commit` + `git push`.
+- Po každém dokončeném úkolu aktualizovat handoff a následně provést serverový `git commit` + `git push` do větve main.
+
+## 13. Oprava WhatsApp replanu a finálního potvrzení (2026-08-03 22:59 CEST)
+
+### Root cause potvrzený z produkčních logů
+
+- EV request kolem `20:38` se správně uložil, ale mimořádný
+  `planner.py --dry-run --verbose` skončil na přechodné kontrole chybějících
+  aktivních cen.
+- Starý worker nekontroloval exit code, neopakoval běh, neověřoval čerstvost ani
+  korelaci forecastu a request po obecném potvrzení přesunul do `done/`.
+- Pozdější regulérní planner run už neměl mechanismus, který by poslal chybějící
+  WhatsApp doporučení.
+
+### Nasazené chování
+
+`planner_v11/whatsapp_request_worker.py VERSION="1.4"` nyní pro každý nový
+`ev_charge`, `boiler_full` a `additional_load`:
+
+1. request idempotentně uloží,
+2. okamžitě odpoví, že je uložený a plán se přepočítává,
+3. nechá claimed JSON v `whatsapp-spool/processing/`,
+4. spustí detached helper a vynutí planner mimo cron,
+5. retry provede až třikrát,
+6. přijme jen forecast s `generated_at >= trigger` a stejným `request_id` v
+   `active_requests`,
+7. pošle druhé finální korelované potvrzení,
+8. teprve potom přesune request do `done/`.
+
+Pokud retry selžou, uživatel dostane explicitní finální zprávu a uložený request
+zůstává aktivní pro další planner run.
+
+### EV a formát odpovědí
+
+- EV model dál vybírá právě jeden souvislý interval
+  `EvCandidate.start_idx..end_idx`; finální zpráva obsahuje
+  `recommended_start–expected_end` a `latest_safe_start`.
+- Request store dovoluje jen jeden aktivní EV request, takže platí požadované
+  jedno nabíjecí okno na den/request.
+- Příkaz `requests` nově u EV zobrazí i timeframe z posledního matching forecastu.
+- Uživatelské časy jsou `český den v týdnu D. M. YYYY HH:MM`, bez sekund a bez
+  `+01:00` / `+02:00`.
+
+### Ověření a rollback
+
+- Candidate `compileall` + full suite: **185/185 passed**.
+- Aktivní deployment `compileall` + full suite: **185/185 passed**.
+- Backup před deployem:
+  `/home/automatization/goodwe/backups/planner_v11_whatsapp_replan_20260803_225908/`.
+- Testy nově kryjí immediate ACK + deferred finalization, retry, odmítnutí
+  fresh-but-uncorrelated forecastu, EV timeframe, boiler/load potvrzení,
+  timeframe v `requests`, user-facing time formatting a souvislost EV okna.
+- Validace nevložila syntetický request do produkčního spoolu ani neměnila
+  produkční `state/requests.json`.

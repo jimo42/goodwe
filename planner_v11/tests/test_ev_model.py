@@ -59,6 +59,14 @@ def test_enumerate_candidates_basic_window():
     # zadny kandidat nekonci po deadline - taper_reserve
     taper = timedelta(minutes=cfg.ev.taper_reserve_minutes)
     assert all(c.end_time <= deadline - taper for c in candidates)
+    # Every option is exactly one contiguous charging window; the model never
+    # returns split intervals for the same request/day.
+    assert all(c.end_idx >= c.start_idx for c in candidates)
+    assert all(
+        c.end_time - c.start_time
+        == timedelta(minutes=(c.end_idx - c.start_idx + 1) * cfg.system.planning_step_minutes)
+        for c in candidates
+    )
 
 
 def test_enumerate_candidates_empty_when_deadline_too_close():

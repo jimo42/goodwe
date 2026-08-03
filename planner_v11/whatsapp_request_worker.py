@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Process validated WhatsApp requests from the spool into planner_v10.
+"""Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 Changelog:
+- v1.4 (2026-08-03): Wait for a fresh correlated on-demand planner result for
+  EV, boiler and additional-load requests, retry transient planner failures,
+  return final planning confirmations, and format user-facing times without
+  seconds/timezone. Include the current EV recommendation in `requests`.
 - v1.3 (2026-07-27): Expire past requests before listing/cancellation and
   return the completed EV recommendation after an on-demand replan.
 - v1.2 (2026-07-25): Reduce `--quiet` polling log noise; do not append
@@ -35,7 +39,10 @@ from typing import Any
 from lib import request_store
 
 
-VERSION = "1.3"
+VERSION = "1.4"
+
+PLANNER_REPLAN_MAX_ATTEMPTS = 3
+PLANNER_REPLAN_RETRY_SECONDS = 5.0
 
 PLANNER_DIR = Path(__file__).resolve().parent
 STATE_DIR = PLANNER_DIR / "state"
@@ -71,6 +78,7 @@ class WorkerPaths:
     planner_log_path: Path = DEFAULT_PLANNER_LOG_PATH
     forecast_path: Path = DEFAULT_FORECAST_PATH
     async_status: bool = True
+    async_planning: bool = True
 
 
 @dataclass(frozen=True)
@@ -251,6 +259,51 @@ def start_async_status_reply(request_path: Path, paths: WorkerPaths, *, verbose:
     log(f"async status reply started for {request_path.name}", paths, verbose=verbose)
 
 
+def _helper_command(paths: WorkerPaths) -> list[str]:
+    return [
+        "--spool-dir",
+        str(paths.spool_dir),
+        "--requests-path",
+        str(paths.requests_path),
+        "--reply-script",
+        str(paths.reply_script),
+        "--show-status-script",
+        str(paths.show_status_script),
+        "--log-path",
+        str(paths.log_path),
+        "--planner-script",
+        str(paths.planner_script),
+        "--planner-log-path",
+        str(paths.planner_log_path),
+        "--forecast-path",
+        str(paths.forecast_path),
+    ]
+
+
+def start_async_request_planning(
+    request_path: Path,
+    paths: WorkerPaths,
+    *,
+    not_before: datetime,
+    verbose: bool = True,
+) -> None:
+    """Start a detached helper that replans, sends the final reply, and finalizes the request."""
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--finish-request-planning",
+        str(request_path),
+        "--replan-not-before",
+        not_before.isoformat(),
+        *_helper_command(paths),
+    ]
+    if not verbose:
+        cmd.append("--quiet")
+    subprocess.Popen(cmd, cwd=str(PLANNER_DIR), close_fds=True)
+    log(f"async request planning started for {request_path.name}", paths, verbose=verbose)
+
+
 def parse_optional_dt(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -261,6 +314,36 @@ def parse_optional_dt(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         return dt.astimezone()
     return dt
+
+
+CZECH_WEEKDAYS = (
+    "pondělí",
+    "úterý",
+    "středa",
+    "čtvrtek",
+    "pátek",
+    "sobota",
+    "neděle",
+)
+
+
+def format_user_datetime(value: Any) -> str:
+    """Format a timestamp for WhatsApp without seconds or timezone suffix."""
+
+    dt = value if isinstance(value, datetime) else parse_optional_dt(value)
+    if dt is None:
+        return "neuvedeno"
+    return f"{CZECH_WEEKDAYS[dt.weekday()]} {dt.day}. {dt.month}. {dt.year} {dt:%H:%M}"
+
+
+def format_user_interval(start_value: Any, end_value: Any) -> str:
+    start = start_value if isinstance(start_value, datetime) else parse_optional_dt(start_value)
+    end = end_value if isinstance(end_value, datetime) else parse_optional_dt(end_value)
+    if start is None or end is None:
+        return f"{format_user_datetime(start_value)}–{format_user_datetime(end_value)}"
+    if start.date() == end.date():
+        return f"{format_user_datetime(start)}–{end:%H:%M}"
+    return f"{format_user_datetime(start)} až {format_user_datetime(end)}"
 
 
 def find_current_forecast_slot(forecast: Any, now: datetime) -> dict[str, Any] | None:
@@ -301,14 +384,40 @@ def request_is_running(item: dict[str, Any], *, now: datetime, forecast: Any) ->
     return False
 
 
-def describe_request(item: dict[str, Any]) -> str:
+def forecast_request(forecast: Any, request_id: str) -> dict[str, Any] | None:
+    if not isinstance(forecast, dict):
+        return None
+    active = forecast.get("active_requests", [])
+    if not isinstance(active, list):
+        return None
+    for item in active:
+        if isinstance(item, dict) and item.get("id") == request_id:
+            return item
+    return None
+
+
+def describe_request(item: dict[str, Any], forecast: Any = None) -> str:
     rtype = item.get("type") or "unknown"
     if rtype == "ev_charge":
-        return f"auto {item.get('required_ac_kwh', 'n/a')} kWh do {item.get('deadline', 'n/a')}"
+        text = f"auto {item.get('required_ac_kwh', 'n/a')} kWh do {format_user_datetime(item.get('deadline'))}"
+        request_id = str(item.get("id") or item.get("request_id") or "")
+        planned = forecast_request(forecast, request_id)
+        recommendation = planned.get("recommendation", {}) if isinstance(planned, dict) else {}
+        if isinstance(recommendation, dict):
+            start = recommendation.get("recommended_start")
+            end = recommendation.get("expected_end")
+            if start and end:
+                text += f". Nabíjení naplánovat na {format_user_interval(start, end)}"
+            elif recommendation.get("reason"):
+                text += f". Zatím bez doporučeného okna: {recommendation['reason']}"
+        return text
     if rtype == "boiler_full":
-        return f"bojler do {item.get('deadline', 'n/a')}"
+        return f"bojler do {format_user_datetime(item.get('deadline'))}"
     if rtype == "additional_load":
-        return f"zátěž {item.get('power_kw', 'n/a')} kW od {item.get('start', 'n/a')} do {item.get('end', 'n/a')}"
+        return (
+            f"zátěž {item.get('power_kw', 'n/a')} kW od {format_user_datetime(item.get('start'))} "
+            f"do {format_user_datetime(item.get('end'))}"
+        )
     return str(rtype)
 
 
@@ -322,13 +431,92 @@ def build_requests_reply(paths: WorkerPaths) -> str:
     for idx, item in enumerate(active, start=1):
         running = request_is_running(item, now=now, forecast=forecast)
         suffix = " (právě probíhá)" if running else ""
-        lines.append(f"{idx}. {describe_request(item)}{suffix}")
+        lines.append(f"{idx}. {describe_request(item, forecast)}{suffix}")
     lines.append("")
     lines.append("Zrušení: cancel <číslo>, např. cancel 1")
     return "\n".join(lines)
 
 
+def forecast_is_fresh_and_correlated(
+    forecast: Any,
+    *,
+    not_before: datetime,
+    request_id: str | None,
+) -> bool:
+    if not isinstance(forecast, dict):
+        return False
+    generated_at = parse_optional_dt(forecast.get("generated_at"))
+    if generated_at is None:
+        return False
+    reference = not_before
+    if reference.tzinfo is not None and generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=reference.tzinfo)
+    elif reference.tzinfo is None and generated_at.tzinfo is not None:
+        reference = reference.replace(tzinfo=generated_at.tzinfo)
+    if generated_at < reference:
+        return False
+    if request_id is not None and forecast_request(forecast, request_id) is None:
+        return False
+    return True
+
+
+def run_planner_replan(
+    paths: WorkerPaths,
+    *,
+    request_id: str | None,
+    not_before: datetime,
+    verbose: bool = True,
+    max_attempts: int = PLANNER_REPLAN_MAX_ATTEMPTS,
+    retry_seconds: float = PLANNER_REPLAN_RETRY_SECONDS,
+) -> dict[str, Any] | None:
+    """Run planner until a fresh, request-correlated forecast is available."""
+
+    if not paths.planner_script.exists():
+        log(f"planner replan skipped, script missing: {paths.planner_script}", paths, verbose=verbose)
+        return None
+    attempts = max(1, max_attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            paths.planner_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(paths.planner_log_path, "a", encoding="utf-8") as log_file:
+                result = subprocess.run(
+                    [sys.executable, str(paths.planner_script), "--dry-run", "--verbose"],
+                    cwd=str(paths.planner_script.parent),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+        except OSError as exc:
+            log(f"planner replan attempt {attempt}/{attempts} failed: {exc}", paths, verbose=verbose)
+        else:
+            if result.returncode == 0:
+                forecast = read_json(paths.forecast_path, {})
+                if forecast_is_fresh_and_correlated(
+                    forecast,
+                    not_before=not_before,
+                    request_id=request_id,
+                ):
+                    log(f"planner replan confirmed after attempt {attempt}/{attempts}", paths, verbose=verbose)
+                    return forecast
+                log(
+                    f"planner replan attempt {attempt}/{attempts} produced stale or uncorrelated forecast",
+                    paths,
+                    verbose=verbose,
+                )
+            else:
+                log(
+                    f"planner replan attempt {attempt}/{attempts} exited with status {result.returncode}",
+                    paths,
+                    verbose=verbose,
+                )
+        if attempt < attempts and retry_seconds > 0:
+            time.sleep(retry_seconds)
+    return None
+
+
 def trigger_planner_replan(paths: WorkerPaths, *, verbose: bool = True) -> bool:
+    """Start a best-effort detached replan when no correlated reply is required."""
+
     if not paths.planner_script.exists():
         log(f"planner trigger skipped, script missing: {paths.planner_script}", paths, verbose=verbose)
         return False
@@ -352,48 +540,130 @@ def trigger_planner_replan(paths: WorkerPaths, *, verbose: bool = True) -> bool:
     return True
 
 
-def run_planner_replan(paths: WorkerPaths, *, verbose: bool = True) -> bool:
-    """Run the read-only planner before replying when a request needs its recommendation."""
-    if not paths.planner_script.exists():
-        log(f"planner replan skipped, script missing: {paths.planner_script}", paths, verbose=verbose)
-        return False
-    try:
-        paths.planner_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(paths.planner_log_path, "a", encoding="utf-8") as log_file:
-            result = subprocess.run(
-                [sys.executable, str(paths.planner_script), "--dry-run", "--verbose"],
-                cwd=str(paths.planner_script.parent),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                check=False,
+def request_planning_reply(store_request: dict[str, Any], forecast: dict[str, Any]) -> str:
+    """Build the final confirmation from a fresh correlated planner forecast."""
+
+    request_id = str(store_request.get("id") or store_request.get("request_id") or "")
+    planned = forecast_request(forecast, request_id)
+    if planned is None:
+        return "Požadavek je uložený, ale v novém plánu se ho nepodařilo potvrdit."
+
+    solver = forecast.get("solver", {})
+    solver_status = solver.get("status") if isinstance(solver, dict) else None
+    if solver_status != "optimal":
+        return f"Požadavek je uložený, ale nový plán není optimální (stav {solver_status or 'neznámý'})."
+
+    rtype = store_request.get("type")
+    if rtype == "ev_charge":
+        rec = planned.get("recommendation", {})
+        if not isinstance(rec, dict):
+            return "Požadavek na nabíjení je uložený, ale planner nevrátil doporučené okno."
+        start = rec.get("recommended_start")
+        end = rec.get("expected_end")
+        latest = rec.get("latest_safe_start")
+        if rec.get("feasible") and start and end:
+            return (
+                f"Nabití auta o přibližně {store_request.get('required_ac_kwh'):g} kWh do "
+                f"{format_user_datetime(store_request.get('deadline'))} je zahrnuto v novém plánu. "
+                f"Nabíjení nastavte na {format_user_interval(start, end)}. "
+                f"Nejpozdější bezpečný start je {format_user_datetime(latest)}."
             )
-    except OSError as exc:
-        log(f"planner replan failed: {exc}", paths, verbose=verbose)
-        return False
-    if result.returncode != 0:
-        log(f"planner replan exited with status {result.returncode}", paths, verbose=verbose)
-        return False
-    return True
+        reason = rec.get("reason") or "Planner nenašel proveditelné nabíjecí okno."
+        return (
+            f"Požadavek na nabití auta do {format_user_datetime(store_request.get('deadline'))} je uložený, "
+            f"ale nelze ho nyní plně potvrdit: {reason}"
+        )
+
+    if rtype == "boiler_full":
+        slacks = forecast.get("optimizer_slacks", {})
+        try:
+            unserved = float(slacks.get("boiler_hard_unserved_kwh", 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            unserved = 0.0
+        if unserved <= 1e-6:
+            return (
+                f"Požadavek nahřát bojler do {format_user_datetime(store_request.get('deadline'))} "
+                "je zahrnutý v novém plánu."
+            )
+        return (
+            f"Požadavek nahřát bojler do {format_user_datetime(store_request.get('deadline'))} je v novém plánu, "
+            f"ale podle aktuálních podmínek zbývá nepokryto přibližně {unserved:.1f} kWh."
+        )
+
+    if rtype == "additional_load":
+        start = parse_optional_dt(store_request.get("start"))
+        end = parse_optional_dt(store_request.get("end"))
+        slots = forecast.get("slots", [])
+        first_slot = parse_optional_dt(slots[0].get("slot_start")) if isinstance(slots, list) and slots else None
+        last_slot = parse_optional_dt(slots[-1].get("slot_start")) if isinstance(slots, list) and slots else None
+        in_horizon = bool(
+            start is not None
+            and end is not None
+            and first_slot is not None
+            and last_slot is not None
+            and end > first_slot
+            and start < last_slot + timedelta(minutes=15)
+        )
+        interval = format_user_interval(store_request.get("start"), store_request.get("end"))
+        if in_horizon:
+            return (
+                f"Dodatečná zátěž {store_request.get('power_kw'):g} kW v čase {interval} "
+                "je zahrnutá v novém plánu."
+            )
+        return (
+            f"Dodatečná zátěž {store_request.get('power_kw'):g} kW v čase {interval} je uložená. "
+            "Interval je zatím mimo aktuální plánovací horizont; planner ji zahrne, jakmile do něj vstoupí."
+        )
+
+    return "Požadavek je uložený a nový plán byl úspěšně přepočítán."
 
 
-def ev_recommendation_reply(paths: WorkerPaths, request_id: str, fallback: str) -> str:
-    """Build a user-facing answer from the freshly written planner recommendation."""
-    forecast = read_json(paths.forecast_path, {})
-    active = forecast.get("active_requests", []) if isinstance(forecast, dict) else []
-    for item in active if isinstance(active, list) else []:
-        if not isinstance(item, dict) or item.get("id") != request_id:
-            continue
-        recommendation = item.get("recommendation", {})
-        if not isinstance(recommendation, dict):
-            break
-        start = recommendation.get("recommended_start")
-        end = recommendation.get("expected_end")
-        if recommendation.get("feasible") and start and end:
-            return f"Nastavte nabíjení auta od {start} do {end}."
-        reason = recommendation.get("reason")
-        if isinstance(reason, str) and reason:
-            return f"Požadavek jsem předal plánovači. {reason}"
-    return fallback
+def finish_request_planning(
+    request_path: Path,
+    paths: WorkerPaths,
+    *,
+    not_before: datetime,
+    verbose: bool = True,
+) -> None:
+    """Complete deferred request planning and preserve spool correlation until the final reply."""
+
+    try:
+        payload = load_request(request_path)
+        request_id, _message_id, _sender_id, commands, created_at = validate_envelope(payload)
+        store_request, _replace_same_type, ok_text = build_store_request(commands[0], request_id, created_at)
+        forecast = run_planner_replan(
+            paths,
+            request_id=request_id,
+            not_before=not_before,
+            verbose=verbose,
+        )
+        if forecast is None:
+            reply = (
+                f"{ok_text} Mimořádný přepočet se nyní nepodařilo potvrdit ani po opakování; "
+                "požadavek zůstává aktivní pro další běh planneru."
+            )
+        else:
+            reply = request_planning_reply(store_request, forecast)
+        reply_to_request(reply, request_path, paths)
+    except RequestError as exc:
+        reply = f"Finální potvrzení požadavku se nepodařilo vytvořit: {exc}"
+        log(f"deferred request error for {request_path}: {exc}", paths, verbose=verbose)
+        try:
+            reply_to_request(reply, request_path, paths)
+        finally:
+            move_request(request_path, paths.spool_dir, "failed")
+        return
+    except Exception as exc:  # noqa: BLE001 - detached helper logs full diagnostics.
+        reply = "Finální potvrzení požadavku selhalo kvůli technické chybě. Detail je v logu."
+        log(f"deferred request technical error for {request_path}: {exc}\n{traceback.format_exc()}", paths, verbose=verbose)
+        try:
+            reply_to_request(reply, request_path, paths)
+        finally:
+            move_request(request_path, paths.spool_dir, "failed")
+        return
+
+    move_request(request_path, paths.spool_dir, "done")
+    log(f"completed deferred request planning {request_path.name}", paths, verbose=verbose)
 
 
 def build_store_request(command: str, request_id: str, created_at: str) -> tuple[dict[str, Any], bool, str]:
@@ -414,7 +684,7 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
                 "request_id": request_id,
             },
             True,
-            f"Rozumím. Předávám plánovači nabití auta o přibližně {energy:g} kWh do {deadline}.",
+            f"Požadavek na nabití auta do {format_user_datetime(deadline)} je uložený. Přepočítávám plán.",
         )
 
     match = HEAT_BOILER_RE.match(command)
@@ -431,7 +701,7 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
                 "request_id": request_id,
             },
             True,
-            f"Rozumím. Předávám plánovači požadavek nahřát bojler do {deadline}.",
+            f"Požadavek nahřát bojler do {format_user_datetime(deadline)} je uložený. Přepočítávám plán.",
         )
 
     match = ADDITIONAL_LOAD_RE.match(command)
@@ -456,7 +726,7 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
                 "request_id": request_id,
             },
             False,
-            f"Rozumím. Předávám plánovači dodatečnou zátěž {power:g} kW od {start} do {end}.",
+            f"Dodatečná zátěž {power:g} kW v čase {format_user_interval(start, end)} je uložená. Přepočítávám plán.",
         )
 
     raise RequestError(
@@ -520,10 +790,29 @@ def process_claimed(path: Path, paths: WorkerPaths, *, verbose: bool = True) -> 
     )
     if result.duplicate:
         return ProcessOutcome(True, "Tento požadavek už byl dříve přijat, znovu ho nezapisuji.")
-    if store_request.get("type") == "ev_charge" and run_planner_replan(paths, verbose=verbose):
-        return ProcessOutcome(True, ev_recommendation_reply(paths, request_id, ok_text))
-    trigger_planner_replan(paths, verbose=verbose)
-    return ProcessOutcome(True, ok_text)
+    replan_started_at = datetime.now().astimezone()
+    if paths.async_planning:
+        reply_to_request(ok_text, path, paths)
+        start_async_request_planning(
+            path,
+            paths,
+            not_before=replan_started_at,
+            verbose=verbose,
+        )
+        return ProcessOutcome(True, None, deferred=True)
+    forecast = run_planner_replan(
+        paths,
+        request_id=request_id,
+        not_before=replan_started_at,
+        verbose=verbose,
+    )
+    if forecast is None:
+        return ProcessOutcome(
+            True,
+            f"{ok_text} Mimořádný přepočet se nyní nepodařilo potvrdit ani po opakování; "
+            "požadavek zůstává aktivní pro další běh planneru.",
+        )
+    return ProcessOutcome(True, request_planning_reply(store_request, forecast))
 
 
 def process_one(paths: WorkerPaths, *, verbose: bool = True) -> bool:
@@ -570,7 +859,7 @@ def process_one(paths: WorkerPaths, *, verbose: bool = True) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Process validated WhatsApp spool requests for planner_v10")
+    parser = argparse.ArgumentParser(description="Process validated WhatsApp spool requests for planner_v11")
     parser.add_argument("--spool-dir", type=Path, default=DEFAULT_SPOOL_DIR)
     parser.add_argument("--requests-path", type=Path, default=DEFAULT_REQUESTS_PATH)
     parser.add_argument("--reply-script", type=Path, default=DEFAULT_REPLY_SCRIPT)
@@ -580,6 +869,8 @@ def main() -> int:
     parser.add_argument("--planner-log-path", type=Path, default=DEFAULT_PLANNER_LOG_PATH)
     parser.add_argument("--forecast-path", type=Path, default=DEFAULT_FORECAST_PATH)
     parser.add_argument("--send-status-reply", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--finish-request-planning", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--replan-not-before", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-requests", type=int, default=20, help="Maximum requests processed per run")
     parser.add_argument("--poll-iterations", type=int, default=5, help="How many polling cycles to run before exiting")
     parser.add_argument("--poll-interval-seconds", type=float, default=10.0, help="Sleep between polling cycles")
@@ -599,6 +890,19 @@ def main() -> int:
 
     if args.send_status_reply is not None:
         send_status_reply(args.send_status_reply, paths, verbose=not args.quiet)
+        return 0
+
+    if args.finish_request_planning is not None:
+        not_before = parse_optional_dt(args.replan_not_before)
+        if not_before is None:
+            print("CHYBA: --finish-request-planning vyžaduje platný --replan-not-before", file=sys.stderr)
+            return 2
+        finish_request_planning(
+            args.finish_request_planning,
+            paths,
+            not_before=not_before,
+            verbose=not args.quiet,
+        )
         return 0
 
     processed = 0
