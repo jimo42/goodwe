@@ -30,6 +30,7 @@ import pulp
 # Normalizovaný status - business logika (lib/optimizer.py) porovnává JEN
 # tyto konstanty, NIKDY přímo pulp.LpStatus stringy.
 STATUS_OPTIMAL = "optimal"
+STATUS_FEASIBLE = "feasible"
 STATUS_INFEASIBLE = "infeasible"
 STATUS_UNBOUNDED = "unbounded"
 STATUS_NOT_SOLVED = "not_solved"
@@ -71,7 +72,15 @@ def solve(
     problem.solve(solver)
     pulp_status = pulp.LpStatus[problem.status]
     status = _PULP_STATUS_MAP.get(pulp_status, STATUS_UNKNOWN)
+    # PuLP 2.7 maps a CBC time-limit stop with an incumbent to the generic
+    # problem status "Optimal", but keeps the more precise solution status as
+    # "Solution Found" (LpSolutionIntegerFeasible). Do not promote that
+    # unproven incumbent to an optimum: the optimizer must be able to fall back
+    # to the previous lexicographic stage instead of publishing stage-3 values.
+    solution_status = getattr(problem, "sol_status", None)
+    if status == STATUS_OPTIMAL and solution_status == pulp.LpSolutionIntegerFeasible:
+        status = STATUS_FEASIBLE
     objective_value = None
-    if status == STATUS_OPTIMAL and problem.objective is not None:
+    if status in (STATUS_OPTIMAL, STATUS_FEASIBLE) and problem.objective is not None:
         objective_value = pulp.value(problem.objective)
     return SolveResult(status=status, objective_value=objective_value, solver_name="pulp_cbc")

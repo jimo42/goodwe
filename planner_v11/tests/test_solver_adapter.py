@@ -46,6 +46,24 @@ def test_solve_milp_with_binary():
     assert round(b.value()) == 1
 
 
+def test_integer_feasible_solution_is_not_reported_as_optimal():
+    prob = pulp.LpProblem("t", pulp.LpMinimize)
+    x = pulp.LpVariable("x", lowBound=0)
+    prob += x
+    prob.status = pulp.LpStatusOptimal
+    prob.sol_status = pulp.LpSolutionIntegerFeasible
+
+    original_solve = pulp.LpProblem.solve
+    pulp.LpProblem.solve = lambda self, solver=None, **kwargs: self.status
+    try:
+        result = sa.solve(prob, time_limit_seconds=5.0, mip_gap=0.001)
+    finally:
+        pulp.LpProblem.solve = original_solve
+
+    assert not result.is_optimal
+    assert result.status == sa.STATUS_FEASIBLE
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

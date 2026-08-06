@@ -74,6 +74,19 @@ if TYPE_CHECKING:
 _EPS = 1e-6
 
 
+def _snapshot_variable_values(prob: pulp.LpProblem) -> dict[pulp.LpVariable, float | None]:
+    """Capture one solved stage before a later solve mutates PuLP values."""
+
+    return {variable: variable.varValue for variable in prob.variables()}
+
+
+def _restore_variable_values(snapshot: dict[pulp.LpVariable, float | None]) -> None:
+    """Restore a previously certified stage solution for safe extraction."""
+
+    for variable, value in snapshot.items():
+        variable.varValue = value
+
+
 # ============================================================================
 # Vstupní/výstupní datové struktury
 # ============================================================================
@@ -444,6 +457,7 @@ def optimize(
         return OptimizerResult(status=result2.status)
 
     stage2_objective = pulp.value(economic_objective)
+    stage2_solution = _snapshot_variable_values(prob)
 
     # ========================================================================
     # STAGE 3: fixovat stage 2 s tolerancí, minimalizovat bateriový
@@ -461,7 +475,15 @@ def optimize(
     result3 = solver_adapter.solve(
         prob, cfg.solver.time_limit_seconds, cfg.solver.mip_gap
     )
-    final_status = result3.status if result3.is_optimal else result2.status
+    if result3.is_optimal:
+        final_status = result3.status
+    else:
+        # A time-limited/failed stage 3 mutates PuLP variable values even
+        # though stage 2 remains the last certified optimum. Restore the full
+        # stage-2 solution before extracting slots; otherwise an incumbent or
+        # partial stage-3 state can leak into a forecast labelled "optimal".
+        _restore_variable_values(stage2_solution)
+        final_status = result2.status
 
     # --- Extrakce výsledku ------------------------------------------------
     slot_results = []

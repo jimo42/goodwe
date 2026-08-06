@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-04 01:09 CEST**
+Aktualizováno: **2026-08-06 14:05 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -77,7 +77,7 @@ Jsou stále užitečné jako architektonické/spec podklady, ale **aktivní runt
 - Lokální staging: `c:\$jimo\sejfik\remote_staging\planner_v11\`.
 - Aktuální ověřené verze:
   - `planner.py 1.5`, `MODEL_VERSION="11-planner-v1"`
-  - `executor.py 2.6`, `MODEL_VERSION="11-executor-v1"`
+  - `executor.py 2.7`, `MODEL_VERSION="11-executor-v1"`
   - `whatsapp_request_worker.py 1.5`
   - `lib/request_store.py 1.3`
   - `lib/alerting.py 1.1`
@@ -528,3 +528,56 @@ zůstává aktivní pro další planner run.
   infeasible/no-start, jiný a neaktivní request, neměnnost initial metadat a
   zápis prvního baseline pouze po úspěšné odpovědi.
 - Nebyl vložen syntetický produkční spool request ani ručně spuštěn executor.
+
+## 15. SoC odchylka a fail-safe timeout solveru (2026-08-06 14:05 CEST)
+
+### Potvrzená interpretace a příčina incidentu
+
+- Původní reason `SOC_DEVIATION_15.7_PCT_POINTS` obsahoval absolutní velikost
+  odchylky. Směr se v reason ani WhatsApp textu nezobrazoval.
+- Alert v `10:33` po replanu nebyl důkazem nové 27bodové chyby vzniklé za půl
+  hodiny. Replan kolem `10:00` skončil po CBC limitu bez certifikovaného optima,
+  takže produkční `forecast_48h.json` zůstal starý z `06:20`. Executor proto
+  porovnal aktuální SoC 66 % se starým plánem 39 % a správně naměřil absolutní
+  rozdíl 27 p. b.; problém byl ve stárnoucím plánu a příliš nízkém 10s limitu.
+
+### Nasazené chování
+
+- `executor.py VERSION="2.7"` používá konfigurovaný threshold
+  `alerts.soc_deviation_threshold_pct_points = 15.0` (alert se spouští včetně
+  přesně 15,0 p. b.). Machine reason je nyní například
+  `SOC_DEVIATION_ABOVE_15.7_PCT_POINTS` nebo
+  `SOC_DEVIATION_BELOW_27.0_PCT_POINTS`; WhatsApp má jednu stručnou řádku:
+  `FVE ALERT: významná odchylka: SOC je o 15.7 % nad/pod plánem`.
+- `solver.time_limit_seconds` je zvýšen z 10 na 60 sekund pro každou z až tří
+  lexikografických fází MILP. Jde tedy o nejvýše 60 s na fázi, ne o jediný
+  globální limit; typický živý běh po nasazení trval 3,9 s.
+- `lib/solver_adapter.py` označí řešení jako `optimal` pouze při současném
+  PuLP/CBC statusu `Optimal` a solution statusu `Optimal Solution Found`.
+  Time-limit incumbent (`Integer Feasible`) se už nesmí vydávat za optimum.
+- Pokud třetí tie-break fáze není optimální, `lib/optimizer.py` obnoví celý
+  certifikovaný snapshot proměnných z optimální druhé fáze. Do forecastu se tak
+  nemůže propsat částečný/necertifikovaný stage-3 incumbent pod statusem
+  `optimal`. Neoptimální stage 1/2 zůstává fail-safe `not_solved` a planner
+  nepřepíše poslední dobrý forecast.
+
+### Ověření a rollback
+
+- Candidate `compileall` + full suite: **197/197 passed**.
+- Aktivní deployment `compileall` + full suite: **197/197 passed**.
+- Živý candidate run nad aktuálními cenami, počasím, requesty a SoC:
+  `optimal`, 192 slotů, 18,2 s.
+- První nový produkční plán po nasazení:
+  `generated_at=2026-08-06T14:04:54+02:00`, `optimal`, 192 slotů, 3,9 s;
+  `forecast.config_hash` odpovídá nové konfiguraci.
+- První normální cron cyklus po nasazení (`planner 14:07`, executor `14:08`):
+  `forecast_valid=true`, bez validačních důvodů, SoC odchylka
+  `SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS`, relay health OK, ECO plán zapsán a
+  ověřen, bojlerový read-back `relay_written`, oba failure countery `0`.
+- Backup před deployem:
+  `/home/automatization/goodwe/backups/planner_v11_soc_timeout_20260806_140448/`.
+- Testy nově kryjí směry ABOVE/BELOW, hranici 14,9/15,0, stručný text,
+  odmítnutí `Integer Feasible` jako optima a obnovení stage-2 hodnot po
+  neoptimální stage 3.
+- Executor nebyl ručně spuštěn; validace tedy nevyvolala dodatečný zápis do
+  střídače ani relé mimo normální plánovaný cyklus.

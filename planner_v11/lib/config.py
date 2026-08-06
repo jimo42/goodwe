@@ -151,6 +151,7 @@ class AlertsConfig:
     daily_report_time: str
     fault_repeat_minutes: float
     pool_repeat_hours: float
+    soc_deviation_threshold_pct_points: float
 
 
 @dataclass(frozen=True)
@@ -409,6 +410,10 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
         daily_report_time=v.get("daily_report_time", str, validator=_hhmm_or_error) or "06:00",
         fault_repeat_minutes=v.get("fault_repeat_minutes", (int, float), min_value=1) or 60.0,
         pool_repeat_hours=v.get("pool_repeat_hours", (int, float), min_value=1) or 24.0,
+        soc_deviation_threshold_pct_points=(
+            v.get("soc_deviation_threshold_pct_points", (int, float), min_value=0.1, max_value=100.0)
+            or 15.0
+        ),
     )
     for k in v.unknown_keys():
         errors.append(f"[alerts.{k}] neznámý klíč")

@@ -384,6 +384,42 @@ def test_empty_slots_returns_infeasible_status():
     assert result.slots == []
 
 
+def test_stage3_nonoptimal_restores_certified_stage2_solution():
+    cfg = _cfg()
+    slots = [_slot(cfg, fixed_load_kwh=0.5, pv_kwh=0.0)]
+    original_solve = opt.solver_adapter.solve
+    calls = 0
+    stage2_values = {}
+
+    def fake_solve(problem, time_limit_seconds, mip_gap):
+        nonlocal calls, stage2_values
+        calls += 1
+        result = original_solve(problem, time_limit_seconds, mip_gap)
+        if calls == 2:
+            stage2_values = {variable.name: variable.varValue for variable in problem.variables()}
+        elif calls == 3:
+            for variable in problem.variables():
+                if variable.name.startswith("soc_"):
+                    variable.varValue = 0.0
+            return opt.solver_adapter.SolveResult(
+                status=opt.solver_adapter.STATUS_FEASIBLE,
+                objective_value=0.0,
+                solver_name="test",
+            )
+        return result
+
+    opt.solver_adapter.solve = fake_solve
+    try:
+        result = opt.optimize(slots, cfg, initial_soc_kwh=_floor_kwh(cfg))
+    finally:
+        opt.solver_adapter.solve = original_solve
+
+    assert calls == 3
+    assert result.status == opt.solver_adapter.STATUS_OPTIMAL
+    assert abs(result.slots[0].soc_start_kwh - stage2_values["soc_0"]) < 1e-6
+    assert abs(result.slots[0].soc_end_kwh - stage2_values["soc_1"]) < 1e-6
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

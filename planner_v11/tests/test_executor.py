@@ -264,7 +264,7 @@ def test_send_executor_alerts_suppresses_soc_deviation_in_dry_run():
             relay_health={"relay_status_ok": True},
             detected_loads={"unexpected_load": {"active": False}},
             deviation_detected=True,
-            deviation_reason="SOC_DEVIATION_12.0_PCT_POINTS",
+            deviation_reason="SOC_DEVIATION_ABOVE_16.0_PCT_POINTS",
             alert_state_path=Path(tmp) / "alert_state.json",
         )
     finally:
@@ -273,6 +273,33 @@ def test_send_executor_alerts_suppresses_soc_deviation_in_dry_run():
 
     assert outcomes == []
     assert calls == []
+
+
+def test_soc_deviation_threshold_and_direction():
+    cfg = _cfg()
+    assert cfg.alerts.soc_deviation_threshold_pct_points == 15.0
+    slot = {"soc_start_pct": 50.0}
+
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 64.9}, cfg)
+    assert detected is False
+    assert reason == "SOC_DEVIATION_OK_ABOVE_14.9_PCT_POINTS"
+
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 65.0}, cfg)
+    assert detected is True
+    assert reason == "SOC_DEVIATION_ABOVE_15.0_PCT_POINTS"
+
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 34.0}, cfg)
+    assert detected is True
+    assert reason == "SOC_DEVIATION_BELOW_16.0_PCT_POINTS"
+
+
+def test_soc_deviation_alert_message_is_concise_and_directional():
+    assert executor.soc_deviation_alert_message("SOC_DEVIATION_ABOVE_15.7_PCT_POINTS") == (
+        "FVE ALERT: významná odchylka: SOC je o 15.7 % nad plánem"
+    )
+    assert executor.soc_deviation_alert_message("SOC_DEVIATION_BELOW_27.0_PCT_POINTS") == (
+        "FVE ALERT: významná odchylka: SOC je o 27.0 % pod plánem"
+    )
 
 
 def test_send_executor_alerts_for_relay_health_failure():

@@ -20,6 +20,8 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v2.7 (2026-08-06): Raise the SoC deviation alert threshold to 15 percentage
+  points and report direction in a concise human-readable one-line message.
 - v2.6 (2026-08-03): Pass confirmed boiler telemetry/ledger context into live
   load detectors so relay-controlled boiler phases are not misclassified as
   `unexpected_load` during active heating.
@@ -59,7 +61,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "2.6"
+VERSION = "2.7"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -766,12 +768,26 @@ def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config) -
     expected_soc = slot.get("soc_start_pct")
     if actual_soc is None or expected_soc is None:
         return False, "SOC_COMPARISON_UNAVAILABLE"
-    deviation = abs(float(actual_soc) - float(expected_soc))
-    # V configu zatím není samostatný práh pro replan; použijeme konzervativní
-    # pevný diagnostický práh 10 procentních bodů jen pro report, nikoli action.
-    if deviation >= 10.0:
-        return True, f"SOC_DEVIATION_{deviation:.1f}_PCT_POINTS"
-    return False, f"SOC_DEVIATION_OK_{deviation:.1f}_PCT_POINTS"
+    signed_deviation = float(actual_soc) - float(expected_soc)
+    deviation = abs(signed_deviation)
+    direction = "ABOVE" if signed_deviation >= 0.0 else "BELOW"
+    # Konfigurovaný diagnostický práh slouží jen pro alert/report, ne jako action.
+    if deviation >= cfg.alerts.soc_deviation_threshold_pct_points:
+        return True, f"SOC_DEVIATION_{direction}_{deviation:.1f}_PCT_POINTS"
+    return False, f"SOC_DEVIATION_OK_{direction}_{deviation:.1f}_PCT_POINTS"
+
+
+def soc_deviation_alert_message(deviation_reason: str) -> str:
+    """Format the machine SoC reason as one concise Czech alert line."""
+
+    parts = str(deviation_reason or "").split("_")
+    if len(parts) >= 6 and parts[:2] == ["SOC", "DEVIATION"]:
+        direction = parts[2]
+        value = parts[3]
+        direction_cs = {"ABOVE": "nad", "BELOW": "pod"}.get(direction)
+        if direction_cs is not None:
+            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem"
+    return f"FVE ALERT: významná odchylka: {deviation_reason}"
 
 
 def detect_runtime_loads(
@@ -946,7 +962,7 @@ def send_executor_alerts(
     if deviation_detected and deviation_reason not in ("UNEXPECTED_LOAD_REPLAN",) and soc_deviation_alert_enabled:
         outcomes.append(alerting.notify_once(
             f"executor.plan_deviation.{deviation_reason.split('_')[0] if deviation_reason else 'unknown'}",
-            f"FVE ALERT: významná odchylka od plánu: {deviation_reason}",
+            soc_deviation_alert_message(deviation_reason),
             cfg=cfg,
             state_path=alert_state_path,
             now=now,
