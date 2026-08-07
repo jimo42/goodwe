@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-06 14:05 CEST**
+Aktualizováno: **2026-08-07 17:00 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -436,6 +436,33 @@ Dokumentace wrapperu je lokálně v `WHATSAPP_AUTOMATION.md`; číst ji jen při
 - Pozorovat produkční v11 logy/runtime po boiler redesignu.
 - Případné další změny business logiky dělat až po aktuálním auditu logů a přes výše uvedený script workflow.
 - Po každém dokončeném úkolu aktualizovat handoff a následně provést serverový `git commit` + `git push` do větve main.
+
+### EV fyzický limit a otevřená perzistence nabíjecí relace (audit 2026-08-07)
+
+- Současné auto fyzicky nepřijme v jedné nabíjecí relaci více než **9 kWh AC**.
+  Každý EV request se proto musí pro plánování interně omezit na
+  `min(required_ac_kwh, 9.0)`, i když uživatel požádá o více. Původní uživatelskou
+  hodnotu je vhodné ponechat auditně v requestu a do forecastu/reportingu přidat
+  efektivní omezenou hodnotu a reason code.
+- Audit aktivního requestu `48159406-edac-4931-b566-35374b3887e6` potvrdil, že
+  planner po zahájení nabíjení dál plánuje celých původních 8 kWh. Oznámené okno
+  bylo `12:15–15:15`; v `16:07` už bylo celé znovu posunuto na `16:00–19:00`,
+  přestože executor odpoledne opakovaně detekoval EV zátěž.
+- Root cause: executor zapisuje pouze okamžitý detektorový snapshot, planner tento
+  stav ani již dodanou energii nenačítá a pro každý nový běh znovu předává solveru
+  celé `required_ac_kwh`. Konfigurační `wallbox_energy_correction` se v aktuálním
+  planneru/executoru nikde prakticky nepoužívá.
+- Produkční wallbox API navíc není nakonfigurované
+  (`wallbox API URL is not configured`), takže je momentálně k dispozici jen
+  fázová heuristika. Ta není přesný elektroměr a v dnešních datech část L1 zátěže
+  současně připsala EV i jedné fázi bojleru; před odečítáním kWh je nutné opravit
+  ownership/dvojí započtení.
+- **Zatím nenasazeno:** navržený směr je perzistentní `ev_session_state.json`,
+  navázaný na `request_id`, se stavy `IDLE/ACTIVE/PAUSED/COMPLETED`, průběžnou
+  energií a `last_positive_at`. Mezery do 30 minut patří do stejné relace
+  (`PAUSED`); teprve souvislá mezera delší než 30 minut relaci ukončí. Planner má
+  plánovat jen `max(0, effective_requested_kwh - delivered_kwh)` a během aktivní
+  nebo krátce přerušené relace nesmí posouvat již přijaté/rozběhnuté okno.
 
 ## 13. Oprava WhatsApp replanu a finálního potvrzení (2026-08-03 22:59 CEST)
 
