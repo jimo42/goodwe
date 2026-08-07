@@ -1,8 +1,10 @@
 """Read-only wallbox API client for immediate EV charging detection.
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 Changelog:
+- v1.2 (2026-08-07): Resolve the private API URL from environment or the
+  untracked conf/wallbox.conf file and retry transient read/parse failures.
 - v1.1 (2026-08-03): Remove hardcoded local wallbox URL from source; production
   URL must be supplied by ignored local configuration.
 - v1.0 (2026-07-24): Add stdlib-only reader for the wallbox JSON API.
@@ -16,16 +18,24 @@ voltage in centivolts can be multiplied to estimate W.
 from __future__ import annotations
 
 import json
+import configparser
+import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 DEFAULT_WALLBOX_API_URL = ""
 DEFAULT_TIMEOUT_SECONDS = 2.0
+DEFAULT_ATTEMPTS = 5
+DEFAULT_RETRY_DELAY_SECONDS = 0.1
+WALLBOX_URL_ENV = "GOODWE_WALLBOX_API_URL"
+DEFAULT_LOCAL_CONFIG_PATH = Path(__file__).resolve().parents[2] / "conf" / "wallbox.conf"
 
 
 class WallboxReadError(Exception):
@@ -123,11 +133,38 @@ def parse_wallbox_payload(payload: dict[str, Any]) -> WallboxState:
     )
 
 
+def resolve_wallbox_api_url(
+    url: str | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+    config_path: Path = DEFAULT_LOCAL_CONFIG_PATH,
+) -> str:
+    """Resolve the private URL without storing it in versioned configuration."""
+
+    if url is not None:
+        return str(url).strip()
+    env = os.environ if environ is None else environ
+    configured = str(env.get(WALLBOX_URL_ENV, "") or "").strip()
+    if configured:
+        return configured
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_path, encoding="utf-8")
+        return str(parser.get("wallbox", "api_url", fallback="") or "").strip()
+    except (OSError, configparser.Error):
+        return ""
+
+
 def read_wallbox_state(
     *,
-    url: str = DEFAULT_WALLBOX_API_URL,
+    url: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     opener: Callable[..., Any] | None = None,
+    attempts: int = DEFAULT_ATTEMPTS,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    sleeper: Callable[[float], Any] = time.sleep,
+    environ: dict[str, str] | None = None,
+    config_path: Path = DEFAULT_LOCAL_CONFIG_PATH,
 ) -> WallboxState:
     """Read wallbox API using only Python stdlib.
 
@@ -135,7 +172,8 @@ def read_wallbox_state(
     parse errors, so executor can safely fall back to phase-load heuristics.
     """
 
-    if not url:
+    resolved_url = resolve_wallbox_api_url(url, environ=environ, config_path=config_path)
+    if not resolved_url:
         return WallboxState(
             available=False,
             charging_power_w=None,
@@ -147,20 +185,25 @@ def read_wallbox_state(
         )
 
     open_fn = opener or urllib.request.urlopen
-    try:
-        with open_fn(url, timeout=timeout_seconds) as response:
-            raw = response.read()
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise WallboxReadError("wallbox API returned non-object JSON")
-        return parse_wallbox_payload(payload)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, WallboxReadError) as exc:
-        return WallboxState(
-            available=False,
-            charging_power_w=None,
-            charging_energy_kwh=None,
-            l1_current_ma=None,
-            l1_voltage_cv=None,
-            source="unavailable",
-            error=str(exc),
-        )
+    last_error = "unknown wallbox read error"
+    for attempt in range(max(1, int(attempts))):
+        try:
+            with open_fn(resolved_url, timeout=timeout_seconds) as response:
+                raw = response.read()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise WallboxReadError("wallbox API returned non-object JSON")
+            return parse_wallbox_payload(payload)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, WallboxReadError) as exc:
+            last_error = str(exc)
+            if attempt + 1 < max(1, int(attempts)) and retry_delay_seconds > 0:
+                sleeper(retry_delay_seconds)
+    return WallboxState(
+        available=False,
+        charging_power_w=None,
+        charging_energy_kwh=None,
+        l1_current_ma=None,
+        l1_voltage_cv=None,
+        source="unavailable",
+        error=last_error,
+    )

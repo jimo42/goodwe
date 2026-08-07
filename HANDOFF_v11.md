@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-07 17:00 CEST**
+Aktualizováno: **2026-08-07 18:12 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -76,9 +76,11 @@ Jsou stále užitečné jako architektonické/spec podklady, ale **aktivní runt
 - Aktivní produkce: `/home/automatization/goodwe/planner_v11/`.
 - Lokální staging: `c:\$jimo\sejfik\remote_staging\planner_v11\`.
 - Aktuální ověřené verze:
-  - `planner.py 1.5`, `MODEL_VERSION="11-planner-v1"`
-  - `executor.py 2.7`, `MODEL_VERSION="11-executor-v1"`
-  - `whatsapp_request_worker.py 1.5`
+  - `planner.py 1.6`, `MODEL_VERSION="11-planner-v1"`
+  - `executor.py 2.8`, `MODEL_VERSION="11-executor-v1"`
+  - `whatsapp_request_worker.py 1.6`
+  - `lib/ev_session.py 1.0`
+  - `lib/wallbox_client.py 1.2`
   - `lib/request_store.py 1.3`
   - `lib/alerting.py 1.1`
   - `lib/relay.py 1.1`
@@ -177,6 +179,8 @@ Závazné pasti:
 - `state_history.jsonl` – append-only historie executor běhů.
 - `boiler_control_state.json` – atomický bojlerový ledger a provozní historie.
 - `requests.json` – aktivní požadavky z WhatsApp/request store.
+- `ev_session_state.json` – atomický stav jedné fyzické EV relace včetně
+  ACTIVE/PAUSED/CLOSED, přímého wallbox counteru, vazby na request a replan claimu.
 - `alert_state.json` – deduplikace alertů/reportů.
 
 ### 7.2 `show_status.py`
@@ -437,7 +441,7 @@ Dokumentace wrapperu je lokálně v `WHATSAPP_AUTOMATION.md`; číst ji jen při
 - Případné další změny business logiky dělat až po aktuálním auditu logů a přes výše uvedený script workflow.
 - Po každém dokončeném úkolu aktualizovat handoff a následně provést serverový `git commit` + `git push` do větve main.
 
-### EV fyzický limit a otevřená perzistence nabíjecí relace (audit 2026-08-07)
+### EV fyzický limit a perzistence nabíjecí relace (audit a implementace 2026-08-07)
 
 - Současné auto fyzicky nepřijme v jedné nabíjecí relaci více než **9 kWh AC**.
   Každý EV request se proto musí pro plánování interně omezit na
@@ -452,17 +456,34 @@ Dokumentace wrapperu je lokálně v `WHATSAPP_AUTOMATION.md`; číst ji jen při
   stav ani již dodanou energii nenačítá a pro každý nový běh znovu předává solveru
   celé `required_ac_kwh`. Konfigurační `wallbox_energy_correction` se v aktuálním
   planneru/executoru nikde prakticky nepoužívá.
-- Produkční wallbox API navíc není nakonfigurované
-  (`wallbox API URL is not configured`), takže je momentálně k dispozici jen
-  fázová heuristika. Ta není přesný elektroměr a v dnešních datech část L1 zátěže
-  současně připsala EV i jedné fázi bojleru; před odečítáním kWh je nutné opravit
-  ownership/dvojí započtení.
-- **Zatím nenasazeno:** navržený směr je perzistentní `ev_session_state.json`,
-  navázaný na `request_id`, se stavy `IDLE/ACTIVE/PAUSED/COMPLETED`, průběžnou
-  energií a `last_positive_at`. Mezery do 30 minut patří do stejné relace
-  (`PAUSED`); teprve souvislá mezera delší než 30 minut relaci ukončí. Planner má
-  plánovat jen `max(0, effective_requested_kwh - delivered_kwh)` a během aktivní
-  nebo krátce přerušené relace nesmí posouvat již přijaté/rozběhnuté okno.
+- **Oprava auditu po upřesnění uživatele:** produkční wallbox API existuje na
+  lokálním endpointu `/api/`; `secc.port0.salia.chargedata` vrací pipe-separated
+  string, jehož druhá hodnota je okamžitý příkon ve W a třetí hodnota je energie
+  aktuální relace v kWh (např. `18159|3060|6.89||`). Existující
+  `lib/wallbox_client.py` tento kontrakt už umí parsovat, ale executor volá klienta
+  bez URL a jeho default je prázdný, proto audit viděl pouze
+  `wallbox API URL is not configured`. Oprava má zprovoznit přímé API; fázová
+  heuristika nesmí být primárním elektroměrem.
+- **Nasazeno; detailní aktuální kontrakt je v sekci 16:** perzistentní
+  `ev_session_state.json` navázaný na `request_id` se stavy
+  `IDLE/ACTIVE/PAUSED/CLOSED`, přímým wallbox counterem a replan claimem. Mezery
+  do 30 minut včetně patří do stejné relace; teprve souvislá dostupná mezera delší
+  než 30 minut ji uzavře. Během ACTIVE/PAUSED se okno neposouvá a plánuje se
+  konzervativní pokračování do fyzického maxima 9 kWh.
+- Pro session stav platí práh wallboxu: příkon **nad 10 W** znamená aktivní odběr;
+  příkon do 10 W včetně je chladicí/balanční/klidový doběh. Relace se uzavře až
+  pokud tento nízký odběr trvá souvisle déle než 30 minut. Jednotky wattů se do
+  plánované energie domu samostatně nezapočítávají.
+- Pokud fyzické nabíjení začne bez aktivního uživatelského EV requestu, executor
+  má vytvořit interní/synthetic požadavek na **6 kWh**. Jedna fyzická relace je
+  vždy omezena maximem **9 kWh**.
+- Uživatelský request určuje plánovací cíl, nikoli fyzické vypnutí wallboxu. Když
+  například request požaduje 4 kWh a auto pokračuje, probíhající odběr se musí dál
+  zahrnout jako nekontrolovatelná zátěž; po dosažení request cíle je pro bezpečný
+  plán vhodné konzervativně počítat s pokračováním až do fyzického maxima 9 kWh.
+  Po skutečném uzavření relace se porovná dodaná energie s cílem a při absolutní
+  odchylce alespoň 2 kWh se jednorázově vynutí replan. Menší nedočerpání je v
+  pořádku a samo o sobě replan nevyžaduje.
 
 ## 13. Oprava WhatsApp replanu a finálního potvrzení (2026-08-03 22:59 CEST)
 
@@ -608,3 +629,64 @@ zůstává aktivní pro další planner run.
   neoptimální stage 3.
 - Executor nebyl ručně spuštěn; validace tedy nevyvolala dodatečný zápis do
   střídače ani relé mimo normální plánovaný cyklus.
+
+## 16. Perzistentní EV nabíjecí relace (2026-08-07 18:12 CEST)
+
+### Nasazený kontrakt wallboxu a session state machine
+
+- `lib/wallbox_client.py 1.2` čte standardní Python stdlib klientem endpoint
+  `/api/` a parsuje `secc.port0.salia.chargedata`: druhá pipe hodnota je okamžitý
+  příkon ve W, třetí je přímý session-local counter v kWh. Klient má pět pokusů
+  a nepoužívá legacy `wallbox_energy_correction`.
+- Privátní URL není ve verzovaném source ani `config.toml`. Produkce ji načítá z
+  neversionovaného `/home/automatization/goodwe/conf/wallbox.conf` s právy `0600`;
+  alternativou je environment `GOODWE_WALLBOX_API_URL`.
+- `lib/ev_session.py 1.0` je jediný kontrakt fyzické relace. `>10 W` znamená
+  `ACTIVE`; `<=10 W` znamená `PAUSED` a relace se uzavře až po souvislé dostupné
+  nízkopříkonové periodě **delší než 30 minut**. Přesně 30 minut je stále stejná
+  relace. API outage stav ani low-power timer neposouvá.
+- Přímý wallbox counter je monotonně evidován do fyzického maxima **9 kWh**.
+  Pokud první vzorek po deployi už zachytí nenulový counter v nízkopříkonovém
+  doběhu, relace se bezpečně bootstrapuje jako `PAUSED`, aby se neztratila již
+  dodaná energie.
+- Při začátku relace se naváže právě aktivní EV request. Bez něj vzniká pouze
+  virtuální/synthetic request na **6 kWh**; nezapisuje se do `requests.json`.
+- User EV requesty nad 9 kWh se při uložení omezí na 9 kWh, ale originál zůstane
+  v `requested_ac_kwh_original`; finální WhatsApp odpověď limit explicitně sdělí.
+  Planner stejný limit aplikuje i defensivně na starší requesty.
+
+### Planner/executor chování
+
+- `executor.py 2.8` je jediný writer `state/ev_session_state.json`. Po přímém
+  wallbox readu aktualizuje relaci atomicky, promítá ji do runtime a při startu
+  (včetně bootstrapu již rozběhnuté relace) nebo uzavřené odchylce alespoň
+  **2 kWh** idempotentně claimne detached planner replan.
+- `planner.py 1.6` v ACTIVE/PAUSED zamkne doporučení od aktuálního slotu a
+  rezervuje možný pokračující odběr až do fyzického maxima 9 kWh, i když user cíl
+  už byl dosažen. Detektorová EV složka se přitom odečte, aby nedošlo k double count.
+- Během ACTIVE/PAUSED se neposílá schedule-change alert a ekonomický model nesmí
+  posunout již běžící okno. Po CLOSED se porovnává skutečnost s cílem. Absolutní
+  odchylka `>=2 kWh` vyvolá jednorázový replan; menší nedočerpání je tolerované a
+  znovu se neplánuje. Overrun se vyhodnotí stejným prahem po uzavření relace.
+- Config hodnota `ev.wallbox_energy_correction` byla nastavena na `1.0`; session
+  modul i tak používá explicitně přímou API energii bez korekce.
+
+### Produkční ověření a rollback
+
+- Izolovaný candidate: `python3 -m compileall -q` + full manual suite
+  **210/210 passed**.
+- Aktivní produkční strom po deployi: `python3 -m compileall -q` +
+  `python3 tests/run_manual.py` → **210/210 passed**.
+- Read-only produkční wallbox loader přes lokální config vrátil dostupný
+  `salia.chargedata` vzorek `6 W / 7.9 kWh` bez chyby.
+- První normální cron executor po deployi, bez ručního spuštění, navázal aktuální
+  doběh na aktivní user request 8 kWh jako `PAUSED`: skutečnost 7,9 kWh,
+  request remaining 0,1 kWh, fyzická rezerva do maxima 1,1 kWh. Replan byl
+  atomicky claimnut a planner 1.6 vytvořil `optimal` forecast se stejnou zamknutou
+  session. Tolerované 0,1kWh nedočerpání se po CLOSED znovu plánovat nebude.
+- Backup před deployem:
+  `/home/automatization/goodwe/planner_v11_backup_ev_session_20260807_180525/`.
+- Testy kryjí API retry/config, přímé parsování, synthetic 6 kWh, user 9kWh cap,
+  přesně/více než 30 minut, resume se stejným ID, outage, bootstrap doběhu,
+  idempotentní replan claim, locked ongoing planner profil, detector double count,
+  tolerované nedočerpání pod 2 kWh a WhatsApp audit/odpověď.

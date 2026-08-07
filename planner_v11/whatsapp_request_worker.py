@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 Changelog:
+- v1.6 (2026-08-07): Cap one EV request at 9 kWh while retaining the original
+  requested energy for audit and explicitly informing the user.
 - v1.5 (2026-08-04): Persist the initial EV schedule notification baseline
   only after the correlated final WhatsApp reply succeeds.
 - v1.4 (2026-08-03): Wait for a fresh correlated on-demand planner result for
@@ -41,7 +43,10 @@ from typing import Any
 from lib import request_store
 
 
-VERSION = "1.5"
+MAX_EV_SESSION_KWH = 9.0
+
+
+VERSION = "1.6"
 
 PLANNER_REPLAN_MAX_ATTEMPTS = 3
 PLANNER_REPLAN_RETRY_SECONDS = 5.0
@@ -562,15 +567,21 @@ def request_planning_reply(store_request: dict[str, Any], forecast: dict[str, An
         rec = planned.get("recommendation", {})
         if not isinstance(rec, dict):
             return "Požadavek na nabíjení je uložený, ale planner nevrátil doporučené okno."
+        original = float(store_request.get("requested_ac_kwh_original", store_request.get("required_ac_kwh", 0.0)) or 0.0)
+        effective = float(store_request.get("required_ac_kwh", 0.0) or 0.0)
+        limit_note = (
+            f" Původně požadovaných {original:g} kWh je kvůli fyzickému limitu jedné relace omezeno na {effective:g} kWh."
+            if original > effective else ""
+        )
         start = rec.get("recommended_start")
         end = rec.get("expected_end")
         latest = rec.get("latest_safe_start")
         if rec.get("feasible") and start and end:
             return (
-                f"Nabití auta o přibližně {store_request.get('required_ac_kwh'):g} kWh do "
+                f"Nabití auta o přibližně {effective:g} kWh do "
                 f"{format_user_datetime(store_request.get('deadline'))} je zahrnuto v novém plánu. "
                 f"Nabíjení nastavte na {format_user_interval(start, end)}. "
-                f"Nejpozdější bezpečný start je {format_user_datetime(latest)}."
+                f"Nejpozdější bezpečný start je {format_user_datetime(latest)}.{limit_note}"
             )
         reason = rec.get("reason") or "Planner nenašel proveditelné nabíjecí okno."
         return (
@@ -715,6 +726,7 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
     match = CHARGE_CAR_RE.match(command)
     if match:
         energy = parse_float(match.group("energy"), "energy_kwh")
+        effective_energy = min(energy, MAX_EV_SESSION_KWH)
         deadline = parse_abs_iso(match.group("deadline"), "deadline")
         return (
             {
@@ -723,13 +735,23 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
                 "created_at": created_at,
                 "available_from": created_at,
                 "deadline": deadline,
-                "required_ac_kwh": energy,
+                "requested_ac_kwh_original": energy,
+                "required_ac_kwh": effective_energy,
+                "energy_limited_to_vehicle_max": energy > MAX_EV_SESSION_KWH,
                 "status": "active",
                 "source": "whatsapp",
                 "request_id": request_id,
             },
             True,
-            f"Požadavek na nabití auta do {format_user_datetime(deadline)} je uložený. Přepočítávám plán.",
+            (
+                f"Požadavek na nabití auta do {format_user_datetime(deadline)} je uložený. "
+                + (
+                    f"Pro jednu fyzickou relaci plánuji nejvýše {effective_energy:g} kWh "
+                    f"místo požadovaných {energy:g} kWh. "
+                    if energy > effective_energy else ""
+                )
+                + "Přepočítávám plán."
+            ),
         )
 
     match = HEAT_BOILER_RE.match(command)

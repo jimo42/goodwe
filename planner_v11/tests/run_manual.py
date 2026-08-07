@@ -24,6 +24,7 @@ import tests.test_detectors as t_detectors  # noqa: E402
 import tests.test_request_store as t_request_store  # noqa: E402
 import tests.test_whatsapp_request_worker as t_whatsapp_request_worker  # noqa: E402
 import tests.test_wallbox_client as t_wallbox_client  # noqa: E402
+import tests.test_ev_session as t_ev_session  # noqa: E402
 import tests.test_alerting as t_alerting  # noqa: E402
 import tests.test_daily_report as t_daily_report  # noqa: E402
 import tests.test_show_status as t_show_status  # noqa: E402
@@ -33,7 +34,7 @@ MODULES = [
     t_economics, t_prices, t_weather, t_solver_adapter, t_optimizer,
     t_load_model, t_pool_model, t_ev_model, t_boiler_model, t_planner,
     t_executor, t_device_adapters, t_detectors, t_request_store,
-    t_whatsapp_request_worker, t_wallbox_client, t_alerting, t_daily_report,
+    t_whatsapp_request_worker, t_wallbox_client, t_ev_session, t_alerting, t_daily_report,
     t_show_status, t_boiler_redesign,
 ]
 

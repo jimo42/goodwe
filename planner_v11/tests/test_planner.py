@@ -595,3 +595,63 @@ def test_ev_schedule_change_skips_missing_baseline_start_infeasible_and_inactive
     finally:
         planner.alerting.notify.send = original
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_active_ev_session_locks_current_window_and_reserves_to_physical_max():
+    cfg = _cfg({"system": {"horizon_hours": 4}})
+    starts = [datetime(2026, 8, 7, 12, 0) + timedelta(minutes=15 * i) for i in range(16)]
+    opt_slots = [
+        optimizer.SlotInput(dt, 1.0, 0.0, True, False, 0.0, 0.1)
+        for dt in starts
+    ]
+    request = {
+        "id": "ev-user", "type": "ev_charge", "required_ac_kwh": 4.0,
+        "deadline": starts[-1] + timedelta(minutes=15), "available_from": starts[0],
+    }
+    session = {
+        "state": "ACTIVE", "session_id": "ev-session", "request_id": "ev-user",
+        "request_source": "user", "effective_target_kwh": 4.0,
+        "delivered_kwh": 4.5, "request_remaining_kwh": 0.0,
+        "physical_remaining_to_max_kwh": 4.5, "current_power_w": 3060.0,
+    }
+    ev_req, _boiler, summary = planner.choose_requests(
+        [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session
+    )
+    assert ev_req is not None
+    assert ev_req.window_start_idx == 0
+    assert ev_req.required_ac_kwh == 4.5
+    assert ev_req.fixed_profile is True
+    ev_summary = next(item for item in summary if item.get("session_id") == "ev-session")
+    assert ev_summary["window_locked"] is True
+    assert ev_summary["request_remaining_kwh"] == 0.0
+
+
+def test_detected_ev_is_removed_when_persistent_session_models_it():
+    detected = {
+        "planning_adjustment": {"kw": 4.0, "components_kw": {"ev": 3.0, "boiler": 1.0}},
+        "unannounced_ev_load": {"active": True, "power_kw": 3.0, "assumed_total_kwh": 8.0},
+    }
+    cleaned = planner.detected_loads_without_session_ev(detected, {"state": "PAUSED"})
+    assert cleaned["planning_adjustment"]["kw"] == 1.0
+    assert cleaned["planning_adjustment"]["components_kw"]["ev"] == 0.0
+    assert cleaned["unannounced_ev_load"]["active"] is False
+
+
+def test_closed_ev_shortfall_below_two_kwh_is_tolerated_not_replanned():
+    cfg = _cfg({"system": {"horizon_hours": 4}})
+    starts = [datetime(2026, 8, 7, 12, 0) + timedelta(minutes=15 * i) for i in range(16)]
+    opt_slots = [optimizer.SlotInput(dt, 1.0, 0.0, True, False, 0.0, 0.1) for dt in starts]
+    request = {
+        "id": "ev-user", "type": "ev_charge", "required_ac_kwh": 8.0,
+        "deadline": starts[-1] + timedelta(minutes=15), "available_from": starts[0],
+    }
+    session = {
+        "state": "CLOSED", "request_id": "ev-user", "delivered_kwh": 7.9,
+    }
+    ev_req, _boiler, summary = planner.choose_requests(
+        [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session
+    )
+    assert ev_req is None
+    ev_summary = next(item for item in summary if item.get("id") == "ev-user")
+    assert ev_summary["closure_shortfall_tolerated"] is True
+    assert ev_summary["actual_request_shortfall_kwh"] == 0.1

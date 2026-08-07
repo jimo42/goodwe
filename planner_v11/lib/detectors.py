@@ -1,9 +1,11 @@
 """
 Live load detectors for planner_v10 executor.
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 Changelog:
+- v1.5 (2026-08-07): Expose planning-adjustment components so the planner can
+  remove EV detector projection when a persistent EV session models it.
 - v1.4 (2026-08-03): Prefer confirmed boiler runtime context from executor
   telemetry/ledger over pure phase-load heuristics, so active boiler phases are
   not misclassified as `unexpected_load` during relay-controlled operation.
@@ -39,7 +41,7 @@ from typing import Any, Optional
 from . import pool_model
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 EV_START_RESIDUAL_KW = 2.4
 EV_START_REQUIRED_SAMPLES_OF_5 = 3
@@ -423,14 +425,16 @@ def detect_loads(
     # detected without an explicit plan, do not project just the instantaneous
     # current power for one hour. Instead expose a separate conservative
     # 8 kWh / 5 h unannounced EV assumption for the planner.
-    planning_adjustment_kw = 0.0 if unannounced_ev_active else max(0.0, ev_kw - planned_ev_kw)
-    planning_adjustment_kw += max(0.0, pool_kw - planned_pool_kw)
-    planning_adjustment_kw += max(0.0, boiler_kw - planned_boiler_kw)
+    ev_adjustment_kw = 0.0 if unannounced_ev_active else max(0.0, ev_kw - planned_ev_kw)
+    pool_adjustment_kw = max(0.0, pool_kw - planned_pool_kw)
+    boiler_adjustment_kw = max(0.0, boiler_kw - planned_boiler_kw)
+    unexpected_adjustment_kw = unexplained_kw if unexpected_active else 0.0
+    planning_adjustment_kw = ev_adjustment_kw + pool_adjustment_kw + boiler_adjustment_kw
     # ARCH section 14 says only an active larger anomaly is projected
     # temporarily into the plan. Short spikes/kettle-like residuals remain only
     # diagnostic until the calibrated size+duration threshold is crossed.
     if unexpected_active:
-        planning_adjustment_kw += unexplained_kw
+        planning_adjustment_kw += unexpected_adjustment_kw
     if planning_adjustment_kw < PLANNING_ADJUSTMENT_MIN_KW:
         planning_adjustment_kw = 0.0
 
@@ -482,6 +486,12 @@ def detect_loads(
         },
         "planning_adjustment": {
             "kw": round(planning_adjustment_kw, 3),
+            "components_kw": {
+                "ev": round(ev_adjustment_kw, 3),
+                "pool": round(pool_adjustment_kw, 3),
+                "boiler": round(boiler_adjustment_kw, 3),
+                "unexpected": round(unexpected_adjustment_kw, 3),
+            },
             "valid_until": (now + timedelta(minutes=60)).isoformat() if planning_adjustment_kw > 0 else None,
             "reason": "ACTIVE_DETECTED_LOADS" if planning_adjustment_kw > 0 else "NO_ADJUSTMENT",
         },

@@ -84,6 +84,12 @@ def _slots_needed(required_ac_kwh: float, planning_power_kw: float, slot_hours: 
     return max(1, math.ceil(hours_needed / slot_hours))
 
 
+def slots_needed(required_ac_kwh: float, planning_power_kw: float, slot_hours: float) -> int:
+    """Public conservative slot-count helper for a locked ongoing session."""
+
+    return _slots_needed(required_ac_kwh, planning_power_kw, slot_hours)
+
+
 def enumerate_candidates(
     slot_starts: list[datetime],
     available_from: datetime,

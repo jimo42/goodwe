@@ -614,3 +614,17 @@ def test_ev_baseline_is_not_persisted_when_final_reply_fails():
         assert (spool / "failed" / "ev-fail.json").exists()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_build_store_request_caps_ev_at_nine_and_preserves_original():
+    request, replace, reply = worker.build_store_request(
+        "charge car;12kWh;2026-08-08T08:00:00+02:00",
+        "req-12",
+        "2026-08-07T17:00:00+02:00",
+    )
+    assert replace is True
+    assert request["requested_ac_kwh_original"] == 12.0
+    assert request["required_ac_kwh"] == 9.0
+    assert request["energy_limited_to_vehicle_max"] is True
+    assert "9 kWh" in reply
+    assert "12 kWh" in reply

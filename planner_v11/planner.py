@@ -26,9 +26,11 @@ Vědomá zjednodušení pro v1:
   - Neprobíhá příprava/zápis near-term ECO akcí; to přijde až s executorem a
     adaptéry s read-back verifikací.
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 Changelog:
+- v1.6 (2026-08-07): Consume the persistent EV session ledger, reserve active
+  physical charging to 9 kWh, lock ongoing windows and avoid detector double count.
 - v1.5 (2026-08-04): Notify significant EV recommendation start shifts
   against the last successfully announced request-scoped baseline.
 - v1.4 (2026-08-02): Production v11 release paired with the v11 executor;
@@ -57,11 +59,11 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from lib import alerting, boiler_model, boiler_state, economics, ev_model, load_model, optimizer, paths, pool_model, prices, request_store, weather
+from lib import alerting, boiler_model, boiler_state, economics, ev_model, ev_session, load_model, optimizer, paths, pool_model, prices, request_store, weather
 from lib.config import Config, ConfigError, load_config
 
 
-VERSION = "1.5"
+VERSION = "1.6"
 MODEL_VERSION = "11-planner-v1"
 SCHEMA_VERSION = 10
 EV_SCHEDULE_CHANGE_MINUTES = 60.0
@@ -75,6 +77,7 @@ BASE_LOAD_PROFILE_PATH = STATE_DIR / "base_load_profile.json"
 DETECTED_LOADS_PATH = STATE_DIR / "detected_loads.json"
 ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
 BOILER_CONTROL_STATE_PATH = STATE_DIR / "boiler_control_state.json"
+EV_SESSION_STATE_PATH = STATE_DIR / "ev_session_state.json"
 
 GOODWE_LIB_DIR = os.path.join(paths.BASE_DIR, "goodwe", "goodwe")
 GOODWE_CONF_PATH = os.path.join(paths.BASE_DIR, "conf", "goodwe.conf")
@@ -479,6 +482,36 @@ def load_active_requests(path: Path = REQUESTS_PATH, tz: Optional[ZoneInfo] = No
     return out
 
 
+def detected_loads_without_session_ev(detected_loads: Any, session_state: Any) -> dict:
+    """Remove only EV projections when ACTIVE/PAUSED is modeled as EvRequest."""
+
+    source = detected_loads if isinstance(detected_loads, dict) else {}
+    cleaned = dict(source)
+    if not isinstance(session_state, dict) or session_state.get("state") not in ev_session.ACTIVE_STATES:
+        return cleaned
+    unannounced = cleaned.get("unannounced_ev_load")
+    if isinstance(unannounced, dict):
+        cleaned["unannounced_ev_load"] = {
+            **unannounced,
+            "active": False,
+            "power_kw": 0.0,
+            "assumed_total_kwh": 0.0,
+            "reason": "MODELED_BY_PERSISTENT_EV_SESSION",
+        }
+    adjustment = cleaned.get("planning_adjustment")
+    if isinstance(adjustment, dict):
+        components = adjustment.get("components_kw")
+        if isinstance(components, dict):
+            ev_kw = max(0.0, float(components.get("ev", 0.0) or 0.0))
+            remaining = max(0.0, float(adjustment.get("kw", 0.0) or 0.0) - ev_kw)
+            cleaned["planning_adjustment"] = {
+                **adjustment,
+                "kw": round(remaining, 3),
+                "components_kw": {**components, "ev": 0.0},
+            }
+    return cleaned
+
+
 def choose_requests(
     requests_list: list[dict],
     starts: list[datetime],
@@ -487,6 +520,7 @@ def choose_requests(
     initial_soc_kwh: float,
     terminal_value_czk_per_kwh: float,
     boiler_daily_limits: Optional[dict] = None,
+    ev_session_state: Optional[dict] = None,
 ) -> tuple[Optional[optimizer.EvRequest], Optional[optimizer.BoilerHardRequest], list[dict]]:
     """Vybere podporované aktivní požadavky a vrátí optimizer requesty + JSON summary."""
     active_summary: list[dict] = []
@@ -531,12 +565,80 @@ def choose_requests(
         else:
             active_summary.append({"type": rtype or "unknown", "status": "unsupported_or_duplicate"})
 
+    session = ev_session_state if isinstance(ev_session_state, dict) else {}
+    session_status = str(session.get("state") or "IDLE")
+    session_request_id = str(session.get("request_id") or "")
+    if session_status in ev_session.ACTIVE_STATES and starts:
+        planning_remaining = max(0.0, min(
+            ev_session.MAX_SESSION_KWH,
+            float(session.get("physical_remaining_to_max_kwh", 0.0) or 0.0),
+        ))
+        current_power_kw = max(0.0, float(session.get("current_power_w", 0.0) or 0.0) / 1000.0)
+        planning_power_kw = min(
+            float(cfg.ev.nominal_power_kw),
+            max(float(cfg.ev.planning_power_kw), current_power_kw),
+        )
+        end_idx = 0
+        if planning_remaining > 1e-6:
+            needed = ev_model.slots_needed(
+                planning_remaining,
+                planning_power_kw,
+                cfg.system.planning_step_minutes / 60.0,
+            )
+            end_idx = min(len(starts) - 1, needed - 1)
+            ev_req = optimizer.EvRequest(
+                0, end_idx, planning_remaining, planning_power_kw, fixed_profile=True
+            )
+        matching_user = (
+            ev_source_req
+            if ev_source_req is not None
+            and str(ev_source_req.get("id") or ev_source_req.get("request_id") or "") == session_request_id
+            else None
+        )
+        summary_id = session_request_id
+        summary_source = session.get("request_source") or "synthetic"
+        deadline = matching_user.get("deadline") if matching_user else None
+        active_summary.append({
+            "type": "ev_charge",
+            "id": summary_id,
+            "request_source": summary_source,
+            "session_id": session.get("session_id"),
+            "session_status": session_status,
+            "window_locked": True,
+            "requested_ac_kwh_original": session.get("requested_ac_kwh_original"),
+            "required_ac_kwh": session.get("effective_target_kwh"),
+            "delivered_kwh": session.get("delivered_kwh"),
+            "request_remaining_kwh": session.get("request_remaining_kwh"),
+            "planning_remaining_to_physical_max_kwh": round(planning_remaining, 3),
+            "deadline": deadline.isoformat() if isinstance(deadline, datetime) else None,
+            "recommendation": {
+                "feasible": True,
+                "recommended_start": starts[0].isoformat(),
+                "latest_safe_start": starts[0].isoformat(),
+                "expected_end": (starts[end_idx] + step).isoformat(),
+                "expected_delivered_kwh": round(planning_remaining, 3),
+                "reason": "Probíhající fyzická relace je zamknutá od aktuálního slotu do maxima 9 kWh.",
+            },
+        })
+        return ev_req, boiler_req, active_summary
+
     # Druhý průchod: EV doporučení a optimizer EvRequest s boiler_req už známým.
     if ev_source_req is not None:
         req = ev_source_req
         rtype = req.get("type")
         try:
-            required = float(req["required_ac_kwh"])
+            original_required = float(req.get("requested_ac_kwh_original", req["required_ac_kwh"]))
+            effective_target = min(ev_session.MAX_SESSION_KWH, max(0.0, float(req["required_ac_kwh"])))
+            delivered = 0.0
+            if session_status == "CLOSED" and session_request_id == str(req.get("id") or req.get("request_id") or ""):
+                delivered = max(0.0, float(session.get("delivered_kwh", 0.0) or 0.0))
+            raw_remaining = round(max(0.0, effective_target - delivered), 3)
+            closure_tolerated = (
+                session_status == "CLOSED"
+                and session_request_id == str(req.get("id") or req.get("request_id") or "")
+                and raw_remaining < ev_session.REPLAN_DEVIATION_KWH
+            )
+            required = 0.0 if closure_tolerated else raw_remaining
             deadline = req["deadline"]
             available_from = req.get("available_from") or starts[0]
         except (KeyError, TypeError, ValueError):
@@ -544,6 +646,26 @@ def choose_requests(
         else:
             if not isinstance(deadline, datetime) or not isinstance(available_from, datetime):
                 active_summary.append({"type": rtype, "status": "invalid_datetime"})
+            elif required <= 1e-6:
+                active_summary.append({
+                    "type": rtype,
+                    "id": req.get("id") or req.get("request_id"),
+                    "requested_ac_kwh_original": original_required,
+                    "required_ac_kwh": effective_target,
+                    "delivered_kwh": delivered,
+                    "request_remaining_kwh": 0.0,
+                    "actual_request_shortfall_kwh": raw_remaining,
+                    "closure_shortfall_tolerated": closure_tolerated,
+                    "session_status": session_status if session_request_id else None,
+                    "recommendation": {
+                        "feasible": True,
+                        "recommended_start": None,
+                        "latest_safe_start": None,
+                        "expected_end": None,
+                        "expected_delivered_kwh": 0.0,
+                        "reason": "Požadovaný cíl již byl v uzavřené relaci dosažen.",
+                    },
+                })
             else:
                 def evaluate(candidate_req: optimizer.EvRequest) -> optimizer.OptimizerResult:
                     return optimizer.optimize(
@@ -640,7 +762,10 @@ def choose_requests(
                 active_summary.append({
                     "type": rtype,
                     "id": req.get("id") or req.get("request_id"),
-                    "required_ac_kwh": required,
+                    "requested_ac_kwh_original": original_required,
+                    "required_ac_kwh": effective_target,
+                    "delivered_kwh": delivered,
+                    "request_remaining_kwh": required,
                     "deadline": deadline.isoformat(),
                     "deadline_outside_current_horizon": deadline > horizon_end if horizon_end is not None else False,
                     "recommendation": {
@@ -757,6 +882,7 @@ def build_forecast_document(
     detected_loads: Optional[dict] = None,
     planner_duration_seconds: Optional[float] = None,
     boiler_budget_diagnostics: Optional[dict] = None,
+    ev_charging_session: Optional[dict] = None,
 ) -> dict:
     capacity = cfg.battery.capacity_kwh
     slots_json = []
@@ -890,6 +1016,7 @@ def build_forecast_document(
         },
         "live_state": live_state,
         "current_soc_pct": live_state.get("battery_soc"),
+        "ev_charging_session": ev_charging_session or {},
         "active_requests": active_requests,
         "optimizer_slacks": {
             "ev_unserved_kwh": round(result.ev_unserved_kwh, 6),
@@ -928,6 +1055,8 @@ def send_ev_schedule_change_alerts(
     outcomes: list[dict] = []
     for req in active_requests:
         if not isinstance(req, dict) or req.get("type") != "ev_charge":
+            continue
+        if req.get("window_locked") or req.get("session_status") in ev_session.ACTIVE_STATES:
             continue
         request_id = _request_alert_key(req)
         rec = req.get("recommendation", {}) if isinstance(req.get("recommendation"), dict) else {}
@@ -1055,11 +1184,13 @@ def run_planner(
         log(f"Označeno jako prošlé requesty: {', '.join(expired_request_ids)}", verbose=verbose)
     additional_requests = load_additional_load_requests(REQUESTS_PATH, tz)
     detected_loads = read_json(DETECTED_LOADS_PATH, {})
+    ev_session_state = ev_session.read_state(EV_SESSION_STATE_PATH)
+    planning_detected_loads = detected_loads_without_session_ev(detected_loads, ev_session_state)
     opt_slots, meta = build_plan_inputs(
         starts,
         cfg,
         additional_requests=additional_requests,
-        detected_loads=detected_loads if isinstance(detected_loads, dict) else {},
+        detected_loads=planning_detected_loads,
     )
     terminal_value = compute_terminal_value_czk_per_kwh(meta, cfg)
     initial_soc = soc_pct_to_kwh(float(live_state["battery_soc"]), cfg)
@@ -1068,7 +1199,8 @@ def run_planner(
     boiler_ledger = read_json(BOILER_CONTROL_STATE_PATH, {})
     boiler_daily_limits, boiler_budget_diagnostics = boiler_daily_budget(starts, cfg, now, boiler_ledger)
     ev_req, boiler_req, active_summary = choose_requests(
-        requests_list, starts, cfg, opt_slots, initial_soc, terminal_value, boiler_daily_limits
+        requests_list, starts, cfg, opt_slots, initial_soc, terminal_value, boiler_daily_limits,
+        ev_session_state=ev_session_state,
     )
 
     log(f"Optimalizuji {len(opt_slots)} slotů, SoC={live_state['battery_soc']} %, terminal={terminal_value:.4f} CZK/kWh", verbose=verbose)
@@ -1093,9 +1225,10 @@ def run_planner(
         active_requests=active_summary,
         terminal_value_czk_per_kwh=terminal_value,
         additional_requests=additional_requests,
-        detected_loads=detected_loads if isinstance(detected_loads, dict) else {},
+        detected_loads=planning_detected_loads,
         planner_duration_seconds=planner_duration_seconds,
         boiler_budget_diagnostics=boiler_budget_diagnostics,
+        ev_charging_session=ev_session_state,
     )
     alert_outcomes = send_planner_alerts(now=now, cfg=cfg, result=result, active_requests=active_summary)
     doc["alerts"] = alert_outcomes

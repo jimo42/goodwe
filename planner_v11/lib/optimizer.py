@@ -118,6 +118,7 @@ class EvRequest:
     window_end_idx: int  # inclusive
     required_ac_kwh: float
     planning_power_kw: float
+    fixed_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -358,6 +359,13 @@ def optimize(
             pulp.lpSum(ev_delivered.values()) + ev_unserved_kwh
             == ev_request.required_ac_kwh
         )
+        if ev_request.fixed_profile:
+            remaining_ev_kwh = ev_request.required_ac_kwh
+            max_ev_slot_kwh = ev_request.planning_power_kw * slot_hours
+            for t in range(ev_request.window_start_idx, ev_request.window_end_idx + 1):
+                fixed_ev_kwh = min(max_ev_slot_kwh, max(0.0, remaining_ev_kwh))
+                prob += ev_delivered[t] == fixed_ev_kwh
+                remaining_ev_kwh -= fixed_ev_kwh
     else:
         prob += ev_unserved_kwh == 0
 

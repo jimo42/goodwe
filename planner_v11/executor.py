@@ -20,6 +20,8 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v2.8 (2026-08-07): Persist direct-wallbox EV charging sessions, bind user or
+  synthetic targets, and trigger idempotent detached replans at start/closure.
 - v2.7 (2026-08-06): Raise the SoC deviation alert threshold to 15 percentage
   points and report direction in a concise human-readable one-line message.
 - v2.6 (2026-08-03): Pass confirmed boiler telemetry/ledger context into live
@@ -49,6 +51,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -56,12 +59,12 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import planner as planner_module
-from lib import alerting, boiler_state, detectors, economics, inverter_client, telemetry, wallbox_client
+from lib import alerting, boiler_state, detectors, economics, ev_session, inverter_client, request_store, telemetry, wallbox_client
 from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "2.7"
+VERSION = "2.8"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -75,6 +78,9 @@ ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
 ECO_PLAN_STATE_PATH = STATE_DIR / "eco_plan_state.json"
 DEVICE_FAILURE_STATE_PATH = STATE_DIR / "device_failure_state.json"
 BOILER_CONTROL_STATE_PATH = STATE_DIR / "boiler_control_state.json"
+EV_SESSION_STATE_PATH = STATE_DIR / "ev_session_state.json"
+REQUESTS_PATH = STATE_DIR / "requests.json"
+PLANNER_REPLAN_LOG_PATH = PLANNER_DIR.parent / "logs" / "planner_v11.log"
 
 PHASE_ORDER = ("L1", "L2", "L3")
 PHASE_CURRENT_KEYS = {
@@ -823,6 +829,48 @@ def read_wallbox_state_for_detection() -> dict:
     return wallbox_client.read_wallbox_state().as_dict()
 
 
+def active_ev_request(now: datetime, path: Path = REQUESTS_PATH) -> Optional[dict]:
+    for item in request_store.active_requests(path, now=now):
+        if isinstance(item, dict) and item.get("type") == "ev_charge":
+            return item
+    return None
+
+
+def trigger_ev_session_replan(
+    *,
+    now: datetime,
+    session_path: Path = EV_SESSION_STATE_PATH,
+    planner_script: Path = PLANNER_DIR / "planner.py",
+    log_path: Path = PLANNER_REPLAN_LOG_PATH,
+) -> dict:
+    """Claim and start one detached read-only planner process."""
+
+    claimed, state = ev_session.claim_replan(session_path, now=now)
+    outcome = {
+        "claimed": claimed,
+        "started": False,
+        "reason": state.get("last_replan_reason") or state.get("replan_reason"),
+    }
+    if not claimed:
+        return outcome
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            subprocess.Popen(
+                [sys.executable, str(planner_script), "--dry-run", "--verbose"],
+                cwd=str(planner_script.parent),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+    except OSError as exc:
+        ev_session.release_replan_claim(session_path)
+        outcome["error"] = str(exc)
+        return outcome
+    outcome["started"] = True
+    return outcome
+
+
 def build_runtime_state(
     *,
     now: datetime,
@@ -840,6 +888,7 @@ def build_runtime_state(
     deviation_reason: str,
     boiler_ledger: Optional[dict] = None,
     telemetry_evidence: Optional[dict] = None,
+    ev_charging_session: Optional[dict] = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -861,6 +910,7 @@ def build_runtime_state(
         "boiler_telemetry": telemetry_evidence or {},
         "relay_health": relay_health,
         "detected_loads": detected_loads,
+        "ev_charging_session": ev_charging_session or {},
         "export_limit": {
             "status": "not_owned_by_v10_executor",
             "note": "existing_check_power_out_only",
@@ -987,6 +1037,8 @@ def run_executor(
     runtime_path: Path = RUNTIME_STATE_PATH,
     history_path: Path = STATE_HISTORY_PATH,
     boiler_state_path: Path = BOILER_CONTROL_STATE_PATH,
+    ev_session_path: Path = EV_SESSION_STATE_PATH,
+    requests_path: Path = REQUESTS_PATH,
     reports_dir: str = telemetry.paths.GOODWE_REPORTS_DIR,
     verbose: bool = True,
 ) -> dict:
@@ -1056,6 +1108,13 @@ def run_executor(
     ledger["current_mask_source"] = confirmed_mask_source
     atomic_write_json(boiler_state_path, ledger)
     wallbox_state = read_wallbox_state_for_detection()
+    session_state = ev_session.update_persisted_session(
+        ev_session_path,
+        now=now,
+        wallbox=wallbox_state,
+        active_ev_request=active_ev_request(now, requests_path),
+    )
+    session_replan = trigger_ev_session_replan(now=now, session_path=ev_session_path)
     detected_loads = detect_runtime_loads(
         now=now,
         cfg=cfg,
@@ -1088,7 +1147,9 @@ def run_executor(
         deviation_reason=deviation_reason,
         boiler_ledger=ledger,
         telemetry_evidence=telemetry_evidence,
+        ev_charging_session=session_state,
     )
+    runtime["ev_session_replan"] = session_replan
     runtime["device_failures"] = {"relay": relay_failure, "battery_eco": battery_failure}
     runtime["alerts"] = send_executor_alerts(
         now=now,
