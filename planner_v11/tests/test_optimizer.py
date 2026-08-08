@@ -420,6 +420,26 @@ def test_stage3_nonoptimal_restores_certified_stage2_solution():
     assert abs(result.slots[0].soc_end_kwh - stage2_values["soc_1"]) < 1e-6
 
 
+def test_stage3_uses_dedicated_short_time_limit():
+    cfg = _cfg({"solver": {"time_limit_seconds": 60, "tie_break_time_limit_seconds": 5}})
+    slots = [_slot(cfg, fixed_load_kwh=0.5)]
+    original_solve = opt.solver_adapter.solve
+    limits = []
+
+    def capture_solve(problem, time_limit_seconds, mip_gap):
+        limits.append(time_limit_seconds)
+        return original_solve(problem, time_limit_seconds, mip_gap)
+
+    opt.solver_adapter.solve = capture_solve
+    try:
+        result = opt.optimize(slots, cfg, initial_soc_kwh=_floor_kwh(cfg))
+    finally:
+        opt.solver_adapter.solve = original_solve
+
+    assert result.status == "optimal"
+    assert limits == [60, 60, 5]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

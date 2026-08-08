@@ -1,6 +1,6 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-07 18:12 CEST**
+Aktualizováno: **2026-08-08 12:44 CEST**
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
@@ -55,6 +55,11 @@ Skript má chytat výjimky, vypsat chybu a skončit `exit 0` při úspěchu nebo
 - Python na serveru: 3.13.5 systémově, bez venv; systém je PEP 668 `externally-managed`.
 - `scipy`, `numpy`, `PuLP 2.7.0` jsou nainstalované systémově a funkční.
 - `pytest` není nainstalovaný; testy spouštět přes `tests/run_manual.py`.
+- Lokální Windows Python je 3.14 na
+  `%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe`;
+  lze ho spouštět také přes `py -3.14`. `python.exe` a `python3.exe` nalezené v
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\` jsou pouze nefunkční
+  MS Store aliasy a pro lokální validaci se nesmí používat.
 - Pokud chybí jakékoli linuxové nebo pythonovské balíčky, **nikdy se je neznažit nainstalovat či obejít**.
   Místo toho si o instalaci uživatelovi.
 
@@ -690,3 +695,50 @@ zůstává aktivní pro další planner run.
   přesně/více než 30 minut, resume se stejným ID, outage, bootstrap doběhu,
   idempotentní replan claim, locked ongoing planner profil, detector double count,
   tolerované nedočerpání pod 2 kWh a WhatsApp audit/odpověď.
+
+## 17. Opakovaný CBC timeout planneru (2026-08-08 12:44 CEST)
+
+### Potvrzený incident a příčina
+
+- Původní tři hlášené běhy vytvořily nevalidní forecasty v `10:07:01`,
+  `10:48:33` (vynucený replan) a `11:07:02`. Během diagnostiky stejně selhal i
+  další plánovaný běh v `12:07:01`. Executor je odmítal s
+  `FORECAST_SOLVER_NOT_OPTIMAL`; alert state uchoval planner status `feasible`.
+- Read-only instrumentovaný běh nad přesnou produkční baseline potvrdil, že CBC
+  vyčerpá 60s limit ve druhé ekonomické fázi lexikografické optimalizace. Nešlo o
+  infeasible model ani chybu vstupních dat: existoval integer incumbent, ale při
+  `solver.mip_gap=0.001` nebylo v limitu certifikováno optimum, takže fail-safe
+  správně zabránil publikování použitelného plánu.
+- Původní limit se aplikoval samostatně na všechny tři fáze. Třetí fáze je pouze
+  throughput tie-break a při neoptimálním výsledku už optimizer umí obnovit
+  certifikovaný snapshot druhé fáze; nebyl proto důvod dávat tomuto tie-breaku
+  dalších 60 sekund.
+
+### Nasazená minimální oprava
+
+- Produkční lokální config používá `solver.mip_gap=0.01`, tj. 1% relativní gap.
+  Read-only benchmark potvrdil, že tato tolerance na aktuálním modelu umožní
+  druhé fázi získat certifikované `optimal` v limitu.
+- `SolverConfig` má nový parametr `tie_break_time_limit_seconds`; produkční
+  hodnota je 5 sekund. Fáze 1 a 2 nadále používají plný
+  `time_limit_seconds=60`, pouze fáze 3 používá krátký samostatný limit.
+- Pokud fáze 3 za 5 sekund optimum nedoloží, zůstává zachované dříve nasazené
+  bezpečné chování: obnoví se celý certifikovaný stage-2 snapshot.
+- Změna byla přenesena jen do aktuální produkční baseline v
+  `lib/config.py`, `lib/optimizer.py` a `tests/test_optimizer.py`; nebyl plošně
+  nasazen odlišný lokální staging strom.
+
+### Ověření, provozní stav a rollback
+
+- Read-only candidate s 1% gapem a 5s tie-break limitem skončil `optimal`; izolovaná
+  optimalizace trvala přibližně 8 sekund.
+- Full manual suite nad candidate i po nasazení přímo z produkční cesty:
+  **211/211 passed**. Nový test potvrzuje solver limity `[60, 60, 5]`.
+- Skutečný produkční `python3 planner.py` po nasazení skončil `RC=0` za 35 sekund.
+  Publikoval forecast `generated_at=2026-08-08T12:38:44.168992+02:00`,
+  `solver.status=optimal`, 192 slotů a nový config hash.
+- První normální executor v `12:43:01` tento forecast přijal:
+  `forecast_valid=true`, bez validačních důvodů. Planner samotný je read-only vůči
+  zařízením; během diagnostiky nebyl ručně vynucen executor.
+- Backup přesné předchozí produkční baseline a forecastu:
+  `/home/automatization/goodwe/planner_v11/backups/20260808_123730_solver_timeout_fix/`.

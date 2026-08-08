@@ -481,7 +481,7 @@ def optimize(
     )
     prob.objective = throughput_objective
     result3 = solver_adapter.solve(
-        prob, cfg.solver.time_limit_seconds, cfg.solver.mip_gap
+        prob, cfg.solver.tie_break_time_limit_seconds, cfg.solver.mip_gap
     )
     if result3.is_optimal:
         final_status = result3.status

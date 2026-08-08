@@ -157,6 +157,7 @@ class AlertsConfig:
 @dataclass(frozen=True)
 class SolverConfig:
     time_limit_seconds: float
+    tie_break_time_limit_seconds: float
     mip_gap: float
     economic_tie_tolerance_czk: float
 
@@ -422,6 +423,9 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
     v = _SectionValidator("solver", raw.get("solver"), errors)
     solver = SolverConfig(
         time_limit_seconds=v.get("time_limit_seconds", (int, float), min_value=0.1) or 30.0,
+        tie_break_time_limit_seconds=(
+            v.get("tie_break_time_limit_seconds", (int, float), min_value=0.1) or 5.0
+        ),
         mip_gap=v.get("mip_gap", (int, float), min_value=0) or 0.001,
         economic_tie_tolerance_czk=v.get("economic_tie_tolerance_czk", (int, float), min_value=0) or 0.0,
     )
