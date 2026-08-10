@@ -9,7 +9,7 @@ Aktualizováno: **2026-08-10 17:13 CEST**
 - SOC alert nyní interpoluje plán mezi `soc_start_pct` a `soc_end_pct` uvnitř 15min slotu, deduplikuje podle stabilního klíče po `fault_repeat_minutes` i při změně čísla a přidává aktuální SOC: `(aktuálně 67%)`.
 - První robustní thermostat-stop bojleru za lokální den (`previous >= 1.0 kW`, aktuálně `<= 0.25 kW`, `sample_count >= 3`, relé stále ON) odešle `Bojler je nahřátý naplno, dnes spotřeboval zhruba X.X kWh.`
 - Přechod existující EV session state machine do `CLOSED` odešle `Auto je nabité, spotřeba X.X kWh.` EV marker je lockovaný a guardovaný `session_id`, takže nepřepíše replan claim.
-- Ověření: `py_compile`, 45/45 cílených hermetických testů a produkční executor rc=0 (`forecast_valid=true`, bez alertu). Backup: `/home/automatization/goodwe/planner_v11/backups/notification_improvements_20260810_171116`.
+- Ověření: `py_compile`, 45/45 cílených a 217/217 plných hermetických testů; ruční i následný cron executor v2.9 skončily rc=0 (`forecast_valid=true`). Git commit/push: `943d80a`. Backup: `/home/automatization/goodwe/planner_v11/backups/notification_improvements_20260810_171116`.
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 
