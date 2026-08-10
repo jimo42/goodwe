@@ -1,6 +1,15 @@
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-08 12:44 CEST**
+Aktualizováno: **2026-08-10 17:13 CEST**
+
+## Update 2026-08-10 — notifikační zpřesnění (produkce)
+
+- Nasazeny verze `executor.py 2.9`, `lib/alerting.py 1.2`, `lib/boiler_state.py 1.2`, `lib/ev_session.py 1.1`.
+- SOC audit (2026-08-06 až 2026-08-10): 1 139 validních vzorků, 38 překročení 15 p. b. v 10 epizodách; všech 38 bylo `ABOVE`, žádné `BELOW`. 37/38 vzniklo u forecastu starého alespoň 30 minut. Data tedy nepotvrdila příliš optimistický SOC plán; hlavní spam způsobovala měnící se hodnota v textu, která obcházela deduplikaci.
+- SOC alert nyní interpoluje plán mezi `soc_start_pct` a `soc_end_pct` uvnitř 15min slotu, deduplikuje podle stabilního klíče po `fault_repeat_minutes` i při změně čísla a přidává aktuální SOC: `(aktuálně 67%)`.
+- První robustní thermostat-stop bojleru za lokální den (`previous >= 1.0 kW`, aktuálně `<= 0.25 kW`, `sample_count >= 3`, relé stále ON) odešle `Bojler je nahřátý naplno, dnes spotřeboval zhruba X.X kWh.`
+- Přechod existující EV session state machine do `CLOSED` odešle `Auto je nabité, spotřeba X.X kWh.` EV marker je lockovaný a guardovaný `session_id`, takže nepřepíše replan claim.
+- Ověření: `py_compile`, 45/45 cílených hermetických testů a produkční executor rc=0 (`forecast_valid=true`, bez alertu). Backup: `/home/automatization/goodwe/planner_v11/backups/notification_improvements_20260810_171116`.
 
 Účel dokumentu: rychlé navázání práce na aktuálně platné produkční verzi **v11** bez historických duplicit.
 

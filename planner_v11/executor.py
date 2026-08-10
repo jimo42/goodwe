@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v2.9 (2026-08-10): Interpolate planned SoC within the current slot, include
+  actual SoC in deviation alerts, deduplicate changing residual values, and send
+  retry-safe boiler-full and EV-session-closed completion notifications.
 - v2.8 (2026-08-07): Persist direct-wallbox EV charging sessions, bind user or
   synthetic targets, and trigger idempotent detached replans at start/closure.
 - v2.7 (2026-08-06): Raise the SoC deviation alert threshold to 15 percentage
@@ -64,7 +67,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "2.8"
+VERSION = "2.9"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -767,11 +770,31 @@ def decide_boiler_execution(
     }
 
 
-def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config) -> tuple[bool, str]:
+def expected_soc_at(slot: dict, now: Optional[datetime], cfg: Config) -> Optional[float]:
+    """Linearly interpolate planned SoC inside the current 15-minute slot."""
+
+    start_soc = slot.get("soc_start_pct")
+    end_soc = slot.get("soc_end_pct")
+    if start_soc is None:
+        return None
+    if end_soc is None or now is None or not slot.get("slot_start"):
+        return float(start_soc)
+    try:
+        slot_start = parse_iso_datetime(str(slot["slot_start"]), ZoneInfo(cfg.system.timezone))
+    except (TypeError, ValueError):
+        return float(start_soc)
+    fraction = (now - slot_start).total_seconds() / (cfg.system.planning_step_minutes * 60.0)
+    fraction = min(1.0, max(0.0, fraction))
+    return float(start_soc) + (float(end_soc) - float(start_soc)) * fraction
+
+
+def detect_plan_deviation(
+    slot: Optional[dict], live_state: dict, cfg: Config, now: Optional[datetime] = None,
+) -> tuple[bool, str]:
     if not slot:
         return False, "NO_CURRENT_SLOT"
     actual_soc = live_state.get("battery_soc")
-    expected_soc = slot.get("soc_start_pct")
+    expected_soc = expected_soc_at(slot, now, cfg)
     if actual_soc is None or expected_soc is None:
         return False, "SOC_COMPARISON_UNAVAILABLE"
     signed_deviation = float(actual_soc) - float(expected_soc)
@@ -783,7 +806,7 @@ def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config) -
     return False, f"SOC_DEVIATION_OK_{direction}_{deviation:.1f}_PCT_POINTS"
 
 
-def soc_deviation_alert_message(deviation_reason: str) -> str:
+def soc_deviation_alert_message(deviation_reason: str, actual_soc: Any = None) -> str:
     """Format the machine SoC reason as one concise Czech alert line."""
 
     parts = str(deviation_reason or "").split("_")
@@ -792,8 +815,75 @@ def soc_deviation_alert_message(deviation_reason: str) -> str:
         value = parts[3]
         direction_cs = {"ABOVE": "nad", "BELOW": "pod"}.get(direction)
         if direction_cs is not None:
-            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem"
+            current = ""
+            try:
+                current = f" (aktuálně {float(actual_soc):.0f}%)"
+            except (TypeError, ValueError):
+                pass
+            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem{current}"
     return f"FVE ALERT: významná odchylka: {deviation_reason}"
+
+
+def detect_boiler_full_completion(
+    ledger: dict, telemetry_evidence: dict, *, now: datetime,
+) -> dict:
+    """Detect the first robust thermostat stop of the local day."""
+
+    day = boiler_state.today_entry(ledger, now.date())
+    previous_kw = float(day.get("previous_confirmed_delivery_kw", 0.0) or 0.0)
+    confirmed_raw = telemetry_evidence.get("confirmed_boiler_delivery_kw")
+    sample_count = int(telemetry_evidence.get("sample_count", 0) or 0)
+    current_mask = ledger.get("current_mask", [])
+    try:
+        confirmed_kw = float(confirmed_raw)
+    except (TypeError, ValueError):
+        confirmed_kw = 0.0
+    detected_now = (
+        not day.get("full_detected_at")
+        and sample_count >= 3
+        and any(bool(value) for value in current_mask[:3])
+        and previous_kw >= 1.0
+        and confirmed_kw <= 0.25
+    )
+    if detected_now:
+        day["full_detected_at"] = now.isoformat()
+    day["previous_confirmed_delivery_kw"] = round(confirmed_kw, 6)
+    return {
+        "detected_now": detected_now,
+        "detected_at": day.get("full_detected_at"),
+        "notification_sent_at": day.get("full_notification_sent_at"),
+        "estimated_delivered_kwh": round(float(day.get("estimated_delivered_kwh", 0.0) or 0.0), 3),
+        "previous_confirmed_delivery_kw": round(previous_kw, 3),
+        "confirmed_delivery_kw": round(confirmed_kw, 3),
+        "sample_count": sample_count,
+    }
+
+
+def completion_notification_candidates(*, now: datetime, ledger: dict, session_state: dict) -> list[dict]:
+    """Build retry-safe one-shot completion notifications from persisted state."""
+
+    candidates: list[dict] = []
+    day = boiler_state.today_entry(ledger, now.date())
+    if day.get("full_detected_at") and not day.get("full_notification_sent_at"):
+        delivered = float(day.get("estimated_delivered_kwh", 0.0) or 0.0)
+        candidates.append({
+            "kind": "boiler_full",
+            "key": f"executor.boiler_full.{now.date().isoformat()}",
+            "message": f"Bojler je nahřátý naplno, dnes spotřeboval zhruba {delivered:.1f} kWh.",
+        })
+    if (
+        isinstance(session_state, dict)
+        and session_state.get("state") == "CLOSED"
+        and session_state.get("session_id")
+        and not session_state.get("completion_notification_sent_at")
+    ):
+        delivered = float(session_state.get("delivered_kwh", 0.0) or 0.0)
+        candidates.append({
+            "kind": "ev_closed",
+            "key": f"executor.ev_closed.{session_state['session_id']}",
+            "message": f"Auto je nabité, spotřeba {delivered:.1f} kWh.",
+        })
+    return candidates
 
 
 def detect_runtime_loads(
@@ -940,6 +1030,10 @@ def send_executor_alerts(
     deviation_reason: str,
     battery_decision: Optional[dict] = None,
     device_failures: Optional[dict] = None,
+    actual_soc: Any = None,
+    boiler_ledger: Optional[dict] = None,
+    ev_charging_session: Optional[dict] = None,
+    ev_session_path: Optional[Path] = None,
     alert_state_path: Path = ALERT_STATE_PATH,
 ) -> list[dict]:
     """Send deduplicated executor-side alerts via notify_admins.sh."""
@@ -1012,11 +1106,32 @@ def send_executor_alerts(
     if deviation_detected and deviation_reason not in ("UNEXPECTED_LOAD_REPLAN",) and soc_deviation_alert_enabled:
         outcomes.append(alerting.notify_once(
             f"executor.plan_deviation.{deviation_reason.split('_')[0] if deviation_reason else 'unknown'}",
-            soc_deviation_alert_message(deviation_reason),
+            soc_deviation_alert_message(deviation_reason, actual_soc),
             cfg=cfg,
             state_path=alert_state_path,
             now=now,
+            deduplicate_message=False,
         ))
+
+    for candidate in completion_notification_candidates(
+        now=now,
+        ledger=boiler_ledger if isinstance(boiler_ledger, dict) else {},
+        session_state=ev_charging_session if isinstance(ev_charging_session, dict) else {},
+    ):
+        outcome = alerting.notify_once(
+            candidate["key"], candidate["message"], cfg=cfg,
+            state_path=alert_state_path, now=now, repeat_minutes=10 * 365 * 24 * 60,
+        )
+        outcomes.append(outcome)
+        if outcome.get("sent"):
+            if candidate["kind"] == "boiler_full":
+                boiler_state.today_entry(boiler_ledger, now.date())["full_notification_sent_at"] = now.isoformat()
+            elif candidate["kind"] == "ev_closed":
+                ev_charging_session["completion_notification_sent_at"] = now.isoformat()
+                if ev_session_path is not None:
+                    ev_session.mark_completion_notification_sent(
+                        ev_session_path, session_id=str(ev_charging_session["session_id"]), now=now,
+                    )
 
     return outcomes
 
@@ -1071,6 +1186,8 @@ def run_executor(
         samples, accounting_mask, cfg.boiler.phase_power_kw, now=now,
         persisted_phase_baseline_kw=ledger.get("phase_baseline_kw"),
     )
+    boiler_completion = detect_boiler_full_completion(ledger, telemetry_evidence, now=now)
+    ledger["boiler_full_completion"] = boiler_completion
     battery_failure = update_device_failure_counter(
         "battery_eco", battery_decision.get("status") not in ("eco_write_failed", "eco_write_verification_failed"), now=now,
     )
@@ -1126,7 +1243,7 @@ def run_executor(
         detector_path=DETECTED_LOADS_PATH,
         wallbox_state=wallbox_state,
     )
-    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg)
+    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg, now=now)
     if detected_loads.get("unexpected_load", {}).get("replan_recommended"):
         deviation_detected = True
         deviation_reason = "UNEXPECTED_LOAD_REPLAN"
@@ -1163,7 +1280,12 @@ def run_executor(
         detected_loads=detected_loads,
         deviation_detected=deviation_detected,
         deviation_reason=deviation_reason,
+        actual_soc=live_state.get("battery_soc"),
+        boiler_ledger=ledger,
+        ev_charging_session=session_state,
+        ev_session_path=ev_session_path,
     )
+    atomic_write_json(boiler_state_path, ledger)
     atomic_write_json(DETECTED_LOADS_PATH, detected_loads)
     atomic_write_json(runtime_path, runtime)
     append_jsonl(history_path, runtime)

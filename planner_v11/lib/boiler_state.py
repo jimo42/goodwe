@@ -1,8 +1,10 @@
 """Atomic boiler command/delivery ledger shared by planner and executor.
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 Changelog:
+- v1.2 (2026-08-10): Persist daily thermostat-stop observation and completion
+  notification metadata alongside the existing delivery ledger.
 - v1.1 (2026-08-02): Split accounting at local midnight and cap stale
   accounting intervals while retaining commanded/delivered separation.
 - v1.0 (2026-08-02): Track daily commanded and estimated delivered energy,
@@ -16,7 +18,7 @@ from typing import Any, Optional
 
 from .telemetry import MinuteSample
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 
 def empty_state() -> dict[str, Any]:
@@ -53,7 +55,13 @@ def today_entry(state: dict, local_date) -> dict:
         "estimated_delivered_kwh": 0.0,
         "delivery_confidence": "none",
         "delivery_source": "no_samples",
+        "previous_confirmed_delivery_kw": 0.0,
+        "full_detected_at": None,
+        "full_notification_sent_at": None,
     })
+    entry.setdefault("previous_confirmed_delivery_kw", 0.0)
+    entry.setdefault("full_detected_at", None)
+    entry.setdefault("full_notification_sent_at", None)
     return entry
 
 

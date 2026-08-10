@@ -88,6 +88,22 @@ def test_ledger_distinguishes_commanded_and_thermostat_no_delivery():
     assert day["delivery_confidence"] == "high"
 
 
+def test_first_daily_thermostat_stop_is_detected_once():
+    tz = ZoneInfo("Europe/Prague")
+    now = datetime(2026, 8, 10, 14, 0, tzinfo=tz)
+    ledger = boiler_state.empty_state()
+    ledger["current_mask"] = [True, False, False]
+    day = boiler_state.today_entry(ledger, now.date())
+    day["estimated_delivered_kwh"] = 8.236
+    day["previous_confirmed_delivery_kw"] = 1.955
+    evidence = {"confirmed_boiler_delivery_kw": 0.043, "sample_count": 5}
+    first = executor.detect_boiler_full_completion(ledger, evidence, now=now)
+    second = executor.detect_boiler_full_completion(ledger, evidence, now=now + timedelta(minutes=5))
+    assert first["detected_now"] is True
+    assert first["estimated_delivered_kwh"] == 8.236
+    assert second["detected_now"] is False
+
+
 def test_ledger_splits_commanded_energy_across_midnight():
     tz = ZoneInfo("Europe/Prague")
     now = datetime(2026, 8, 3, 0, 5, tzinfo=tz)

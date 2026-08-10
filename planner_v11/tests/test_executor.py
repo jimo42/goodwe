@@ -293,10 +293,75 @@ def test_soc_deviation_threshold_and_direction():
     assert reason == "SOC_DEVIATION_BELOW_16.0_PCT_POINTS"
 
 
+def test_soc_deviation_interpolates_current_slot():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 8, 10, 10, 7, 30, tzinfo=tz)
+    slot = {
+        "slot_start": datetime(2026, 8, 10, 10, 0, tzinfo=tz).isoformat(),
+        "soc_start_pct": 40.0,
+        "soc_end_pct": 60.0,
+    }
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 65.0}, cfg, now=now)
+    assert detected is True
+    assert reason == "SOC_DEVIATION_ABOVE_15.0_PCT_POINTS"
+
+
 def test_soc_deviation_alert_message_is_concise_and_directional():
-    assert executor.soc_deviation_alert_message("SOC_DEVIATION_ABOVE_15.7_PCT_POINTS") == (
-        "FVE ALERT: významná odchylka: SOC je o 15.7 % nad plánem"
+    assert executor.soc_deviation_alert_message("SOC_DEVIATION_ABOVE_15.7_PCT_POINTS", 67) == (
+        "FVE ALERT: významná odchylka: SOC je o 15.7 % nad plánem (aktuálně 67%)"
     )
+
+
+def test_soc_alert_deduplicates_even_when_value_changes():
+    cfg = _cfg({"system": {"dry_run": False, "battery_write_enabled": True}})
+    now = datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    calls = []
+    original = executor.alerting.notify.send
+    executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v11_soc_dedup_")
+    kwargs = dict(
+        cfg=cfg, forecast_valid=True, forecast_reasons=[], boiler_decision={},
+        relay_health={"relay_status_ok": True}, detected_loads={},
+        deviation_detected=True, alert_state_path=Path(tmp) / "alerts.json", actual_soc=67,
+    )
+    try:
+        executor.send_executor_alerts(now=now, deviation_reason="SOC_DEVIATION_ABOVE_28.0_PCT_POINTS", **kwargs)
+        executor.send_executor_alerts(now=now + timedelta(minutes=5), deviation_reason="SOC_DEVIATION_ABOVE_27.0_PCT_POINTS", **kwargs)
+    finally:
+        executor.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert len(calls) == 1
+
+
+def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
+    cfg = _cfg()
+    now = datetime(2026, 8, 10, 16, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    ledger = executor.boiler_state.empty_state()
+    day = executor.boiler_state.today_entry(ledger, now.date())
+    day.update({"full_detected_at": now.isoformat(), "estimated_delivered_kwh": 8.24})
+    session = {"state": "CLOSED", "session_id": "ev-test", "delivered_kwh": 7.9}
+    calls = []
+    original = executor.alerting.notify.send
+    executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v11_completion_alerts_")
+    try:
+        outcomes = executor.send_executor_alerts(
+            now=now, cfg=cfg, forecast_valid=True, forecast_reasons=[], boiler_decision={},
+            relay_health={"relay_status_ok": True}, detected_loads={}, deviation_detected=False,
+            deviation_reason="SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS", boiler_ledger=ledger,
+            ev_charging_session=session, alert_state_path=Path(tmp) / "alerts.json",
+        )
+    finally:
+        executor.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert len(outcomes) == 2
+    assert calls == [
+        "Bojler je nahřátý naplno, dnes spotřeboval zhruba 8.2 kWh.",
+        "Auto je nabité, spotřeba 7.9 kWh.",
+    ]
+    assert day["full_notification_sent_at"] == now.isoformat()
+    assert session["completion_notification_sent_at"] == now.isoformat()
     assert executor.soc_deviation_alert_message("SOC_DEVIATION_BELOW_27.0_PCT_POINTS") == (
         "FVE ALERT: významná odchylka: SOC je o 27.0 % pod plánem"
     )

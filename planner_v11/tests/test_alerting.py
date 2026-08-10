@@ -58,3 +58,26 @@ def test_notify_once_repeats_after_window():
     finally:
         alerting.notify.send = original
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_notify_once_can_deduplicate_by_key_when_message_changes():
+    tmp = _tmpdir()
+    original = alerting.notify.send
+    calls = []
+    try:
+        state_path = Path(tmp) / "alert_state.json"
+        alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+        now = datetime(2026, 8, 10, 7, 0, tzinfo=timezone.utc)
+        alerting.notify_once(
+            "soc", "28.0", state_path=state_path, now=now,
+            repeat_minutes=60, deduplicate_message=False,
+        )
+        second = alerting.notify_once(
+            "soc", "27.0", state_path=state_path, now=now + timedelta(minutes=5),
+            repeat_minutes=60, deduplicate_message=False,
+        )
+        assert second["reason"] == "deduplicated"
+        assert calls == ["28.0"]
+    finally:
+        alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)

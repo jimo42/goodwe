@@ -1,8 +1,10 @@
 """Persistent physical EV charging-session state machine.
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 Changelog:
+- v1.1 (2026-08-10): Add a session-identity guarded persistence helper for
+  completion notification delivery metadata.
 - v1.0 (2026-08-07): Track wallbox-backed ACTIVE/PAUSED/CLOSED sessions,
   bind one user or synthetic target, and provide atomic replan claims.
 
@@ -19,7 +21,7 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
@@ -112,6 +114,18 @@ def read_state(path: Path) -> dict[str, Any]:
 
 def write_state(path: Path, state: dict[str, Any]) -> None:
     request_store.atomic_write_json(path, state)
+
+
+def mark_completion_notification_sent(path: Path, *, session_id: str, now: datetime) -> dict[str, Any]:
+    """Mark only the current matching session without reverting replan claims."""
+
+    with request_store.request_store_lock(path):
+        current = read_state(path)
+        if current.get("session_id") != session_id:
+            return current
+        current["completion_notification_sent_at"] = _iso(now)
+        write_state(path, current)
+        return current
 
 
 def _start_session(

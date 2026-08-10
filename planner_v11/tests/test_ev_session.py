@@ -10,6 +10,24 @@ from lib import ev_session
 TZ = ZoneInfo("Europe/Prague")
 
 
+def test_completion_notification_marker_preserves_replan_claim():
+    now = datetime(2026, 8, 10, 17, 0, tzinfo=TZ)
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_marker_"))
+    path = tmp / "ev.json"
+    try:
+        ev_session.write_state(path, {
+            "session_id": "ev-current", "state": "CLOSED",
+            "replan_required": False, "replan_claimed_at": now.isoformat(),
+        })
+        marked = ev_session.mark_completion_notification_sent(
+            path, session_id="ev-current", now=now,
+        )
+        assert marked["replan_claimed_at"] == now.isoformat()
+        assert marked["completion_notification_sent_at"] == now.isoformat(timespec="seconds")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _wallbox(power_w: float, energy_kwh: float) -> dict:
     return {
         "available": True,

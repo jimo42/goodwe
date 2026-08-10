@@ -1,9 +1,11 @@
 """
 Deduplicated admin alerts for planner_v10.
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 Changelog:
+- v1.2 (2026-08-10): Allow selected alerts to deduplicate by key and repeat
+  interval even when measured values change in the human-readable message.
 - v1.1 (2026-08-04): Serialize deduplication decisions and state updates so
   overlapping planner runs cannot send the same alert concurrently.
 - v1.0 (2026-07-24): Add JSON-backed deduplication over `notify_admins.sh`
@@ -33,7 +35,7 @@ except ImportError:  # pragma: no cover - local Windows test compatibility.
 from . import notify
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 PLANNER_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = PLANNER_DIR / "state"
 DEFAULT_ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
@@ -112,6 +114,7 @@ def notify_once(
     now: datetime | None = None,
     repeat_minutes: float | None = None,
     force: bool = False,
+    deduplicate_message: bool = True,
 ) -> dict:
     """Send a deduplicated alert and persist last-send metadata."""
 
@@ -128,7 +131,7 @@ def notify_once(
             not force
             and last_sent is not None
             and now - last_sent < repeat_delta
-            and existing.get("last_message") == message
+            and (not deduplicate_message or existing.get("last_message") == message)
         ):
             return {"sent": False, "reason": "deduplicated", "key": key, "last_sent_at": last_sent.isoformat()}
 
