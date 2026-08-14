@@ -40,6 +40,8 @@ Vědomá zjednodušení pro v1 (dokumentovaná, ne skryté zkratky):
 """
 from __future__ import annotations
 
+import time
+
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -183,8 +185,19 @@ def evaluate_candidates(
             required_ac_kwh=required_ac_kwh,
             planning_power_kw=cfg.ev.planning_power_kw,
         )
+        started = time.monotonic()
         result = evaluate_fn(req)
-        if result.ev_unserved_kwh > 1e-6:
+        elapsed = time.monotonic() - started
+        print(
+            "EV_CANDIDATE "
+            f"start={c.start_time.isoformat()} end={c.end_time.isoformat()} "
+            f"status={result.status} duration_seconds={elapsed:.3f}",
+            flush=True,
+        )
+        # A time-limited incumbent is not a certified candidate. In particular,
+        # optimizer returns no slots for non-optimal stage 1/2 results, so treating
+        # its default zero slack/objective as feasible would select a false window.
+        if result.status != "optimal" or result.ev_unserved_kwh > 1e-6:
             continue
         if best_result is None or result.economic_objective_czk < best_result.economic_objective_czk:
             best_candidate = c

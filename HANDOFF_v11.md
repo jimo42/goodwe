@@ -751,3 +751,66 @@ zůstává aktivní pro další planner run.
   zařízením; během diagnostiky nebyl ručně vynucen executor.
 - Backup přesné předchozí produkční baseline a forecastu:
   `/home/automatization/goodwe/planner_v11/backups/20260808_123730_solver_timeout_fix/`.
+
+## 18. EV request timeout, fail-safe publikace a 72h weather (2026-08-14 13:47 CEST)
+
+### Rekonstrukce incidentu z 2026-08-13
+
+- První EV request `3aecc9b7-c5bd-4df4-942a-63ce1e3e1a73` byl uložen v 17:28.
+  Vynucený planner běh skončil přibližně po 127 s se statusem `feasible`; worker
+  jej po pěti sekundách spustil znovu a druhý běh opět vyčerpal limit. Request byl
+  následně zrušen, takže plánovaný cron v 18:07 běžel bez EV requestu a skončil
+  `optimal` za 4,3 s.
+- Druhý EV request `af8aec3c-4f18-430d-be80-b1d66b23e81f` byl uložen v 18:31.
+  Oba worker pokusy znovu skončily `feasible` po přibližně 127–128 s. Request
+  zůstal aktivní; pravidelný běh v 19:07 již skončil `optimal` za 30,4 s a request
+  zahrnul. Nešlo tedy o ztracený request ani o čekání na hodinový weather cron,
+  ale o deterministicky obtížnou MILP instanci, která se posunem 48h horizontu
+  stala řešitelnou v limitu.
+- Produkční planner tehdy zapisoval neoptimální forecast a vracel `RC=0`.
+  Worker proto opakoval stejnou drahou instanci, ale čerstvý forecast správně
+  odmítl jako nekorelovaný/neoptimální. Executor jej rovněž správně blokoval přes
+  `FORECAST_SOLVER_NOT_OPTIMAL`. Uživatelský symptom byl dlouhé čekání a obecná
+  chyba, nikoli použití necertifikovaného plánu zařízením.
+- Samostatně byl potvrzen sekundární vstupní defekt: downloader s
+  `forecast_days=2` ukládal jen dnešek a zítřek. 48h planner spuštěný po půlnoci
+  proto neměl počasí pro poslední část horizontu a konzervativně dosazoval nulové
+  PV. To nebyla příčina časového vzoru 18:31 → 19:07, ale mohlo to zhoršovat
+  ekonomickou kvalitu a stabilitu hraničních plánů.
+
+### Nasazené chování
+
+- `planner.py 1.8` publikuje nový `forecast_48h.json` pouze při
+  `solver.status=optimal`. Při `feasible/not_solved/infeasible` zachová poslední
+  certifikovaný forecast, pošle pouze solver alert a vrátí exit code `4`.
+- `lib/ev_model.py` už nepovažuje neoptimální candidate incumbent s implicitní
+  nulovou slack hodnotou za proveditelný. Každé plné EV candidate MILP nyní loguje
+  start, konec, solver status a dobu běhu jako `EV_CANDIDATE ...`.
+- `whatsapp_request_worker.py 1.7` přijme pouze čerstvý korelovaný forecast se
+  statusem `optimal`. Exit code `4` neopakuje uvnitř stejného requestu; retry
+  zůstává jen pro přechodné technické chyby. Finální EV odpověď obsahuje jediný
+  doporučený interval a samostatně nejpozdější bezpečný start.
+- `weather-forecast/download-weather.py 1.1` stahuje tři lokální kalendářní dny
+  (`forecast_days=3`, nominálně 72 hodin), zapisuje jeden CSV soubor na den a při
+  síťové/neúplné odpovědi ponechá existující CSV beze změny. Validace toleruje
+  23/25hodinový DST den.
+- Forecast diagnostika obsahuje `diagnostics.weather_coverage` s počtem pokrytých
+  a chybějících slotů a prvním chybějícím slotem. Po refreshi 2026-08-14 měl
+  produkční 48h smoke run pokrytí `192/192`, `missing_slots=0`.
+
+### Ověření, provozní stav a rollback
+
+- Izolovaný candidate i finální produkční strom: full manual suite
+  **222/222 passed**; samostatné weather testy prošly.
+- Izolovaný skutečný Open-Meteo download i produkční refresh vytvořily tři CSV
+  `2026-08-14.csv` až `2026-08-16.csv`, každý s 24 datovými řádky.
+- Read-only produkční planner smoke s `--initial-soc 50` a výstupem pouze do
+  `/tmp/planner_v11_smoke.json` skončil `RC=0`, `optimal`, 192 slotů za 5,4 s;
+  `weather_coverage.complete=true`. Aktivní forecast na produkční cestě zůstal
+  tímto smoke během beze změny a executor nebyl ručně spuštěn.
+- Testy nově kryjí zachování posledního forecastu při neoptimálním solveru,
+  potlačení request/schedule alertů z necertifikovaného běhu, odmítnutí
+  neoptimální korelace, zastavení worker retry po exit code 4, jednoznačný EV text
+  a detekci chybějícího weather slotu.
+- Backup před deployem:
+  `/home/automatization/goodwe/backups/planner_weather_fix_20260814_1337.tar.gz`.

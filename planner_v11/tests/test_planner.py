@@ -89,6 +89,29 @@ def test_build_plan_inputs_uses_actual_price_weather_and_pool_load():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_weather_coverage_reports_first_missing_slot():
+    cfg = _cfg()
+    starts = [datetime(2026, 7, 22, 23, 45), datetime(2026, 7, 23, 0, 0)]
+    tmp = tempfile.mkdtemp(prefix="planner_v11_weather_coverage_")
+    try:
+        weather_dir = os.path.join(tmp, "weather")
+        prices_dir = os.path.join(tmp, "prices")
+        os.makedirs(weather_dir)
+        os.makedirs(prices_dir)
+        _make_weather_day(os.path.join(weather_dir, "2026-07-22.csv"))
+        _make_price_day(os.path.join(prices_dir, "2026-07-22.csv"), 100.0)
+        _, meta = planner.build_plan_inputs(
+            starts, cfg, prices_dir=prices_dir, weather_dir=weather_dir, base_profile={}
+        )
+        coverage = planner.weather_coverage(meta)
+        assert coverage["complete"] is False
+        assert coverage["covered_slots"] == 1
+        assert coverage["missing_slots"] == 1
+        assert coverage["first_missing_slot"] == "2026-07-23T00:00:00"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_terminal_value_is_capped_by_last_slot_import():
     cfg = _cfg()
     now = datetime(2026, 7, 22, 12, 0)
@@ -192,6 +215,75 @@ def test_build_forecast_document_minimal_contract():
     assert doc["diagnostics"]["planned_boiler_hard_kwh_next_24h"] == 0.0
     assert doc["diagnostics"]["planned_boiler_opportunistic_kwh_next_24h"] == 0.0
     assert doc["diagnostics"]["planner_duration_seconds"] == 1.234
+
+
+def test_run_planner_does_not_replace_forecast_when_solver_is_nonoptimal():
+    cfg = _cfg()
+    now = datetime(2026, 7, 22, 12, 0)
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_nonoptimal_forecast_"))
+    output_path = tmp / "forecast_48h.json"
+    original_forecast = {"solver": {"status": "optimal"}, "sentinel": "keep-me"}
+    output_path.write_text(json.dumps(original_forecast), encoding="utf-8")
+
+    originals = {
+        "expire": planner.request_store.expire_past_requests,
+        "additional": planner.load_additional_load_requests,
+        "read_json": planner.read_json,
+        "session": planner.ev_session.read_state,
+        "build": planner.build_plan_inputs,
+        "active": planner.load_active_requests,
+        "budget": planner.boiler_daily_budget,
+        "choose": planner.choose_requests,
+        "optimize": planner.optimizer.optimize,
+        "alerts": planner.send_planner_alerts,
+    }
+    meta = planner.SlotPlanInput(
+        slot_start=now, price_eur_mwh=100.0, price_export_eur_mwh=100.0,
+        price_source="actual", import_price_czk_kwh=1.0, export_revenue_czk_kwh=0.5,
+        pv_estimate_kwh=0.0, base_load_expected_kwh=0.1, base_load_reserve_kwh=0.1,
+        base_load_source="profile", pool_load_kwh=0.0, pool_heat_pump_kwh=0.0,
+        additional_load_kwh=0.0, export_allowed=True, effective_import_nonpositive=False,
+        sun_pct=None, cloudcover_pct=None,
+    )
+    opt_slot = optimizer.SlotInput(
+        slot_start=now, price_import_czk_kwh=1.0, price_export_czk_kwh=0.5,
+        export_allowed=True, effective_import_nonpositive=False, pv_kwh=0.0,
+        fixed_load_kwh=0.1,
+    )
+    alert_calls = []
+    try:
+        planner.request_store.expire_past_requests = lambda *args, **kwargs: []
+        planner.load_additional_load_requests = lambda *args, **kwargs: []
+        planner.read_json = lambda *args, **kwargs: {}
+        planner.ev_session.read_state = lambda *args, **kwargs: {}
+        planner.build_plan_inputs = lambda *args, **kwargs: ([opt_slot], [meta])
+        planner.load_active_requests = lambda *args, **kwargs: []
+        planner.boiler_daily_budget = lambda *args, **kwargs: ({now.date(): 15.0}, {})
+        planner.choose_requests = lambda *args, **kwargs: (None, None, [])
+        planner.optimizer.optimize = lambda *args, **kwargs: optimizer.OptimizerResult(status="feasible")
+        planner.send_planner_alerts = lambda **kwargs: alert_calls.append(kwargs["result"].status) or []
+
+        result = planner.run_planner(
+            cfg=cfg, now=now, live_state={"battery_soc": 50.0},
+            output_path=output_path, verbose=False,
+        )
+    finally:
+        planner.request_store.expire_past_requests = originals["expire"]
+        planner.load_additional_load_requests = originals["additional"]
+        planner.read_json = originals["read_json"]
+        planner.ev_session.read_state = originals["session"]
+        planner.build_plan_inputs = originals["build"]
+        planner.load_active_requests = originals["active"]
+        planner.boiler_daily_budget = originals["budget"]
+        planner.choose_requests = originals["choose"]
+        planner.optimizer.optimize = originals["optimize"]
+        planner.send_planner_alerts = originals["alerts"]
+
+    assert result["published"] is False
+    assert result["solver"]["status"] == "feasible"
+    assert json.loads(output_path.read_text(encoding="utf-8")) == original_forecast
+    assert alert_calls == ["feasible"]
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_forecast_document_splits_boiler_hard_and_opportunistic_energy():
@@ -375,6 +467,38 @@ def test_send_planner_alerts_for_infeasible_ev_request():
     assert len(outcomes) == 1
     assert outcomes[0]["sent"] is True
     assert "požadavek na nabití auta" in calls[0]
+
+
+def test_send_planner_alerts_nonoptimal_run_emits_only_solver_alert():
+    cfg = _cfg()
+    now = datetime(2026, 7, 24, 12, 0)
+    result = optimizer.OptimizerResult(status="feasible", ev_unserved_kwh=1.0)
+    active_requests = [{
+        "type": "ev_charge",
+        "id": "ev-untrusted",
+        "recommendation": {
+            "feasible": True,
+            "recommended_start": "2026-07-24T13:00:00+02:00",
+            "expected_end": "2026-07-24T15:00:00+02:00",
+        },
+    }]
+    calls = []
+    original = planner.alerting.notify.send
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v11_nonoptimal_alerts_")
+    try:
+        outcomes = planner.send_planner_alerts(
+            now=now, cfg=cfg, result=result, active_requests=active_requests,
+            requests_path=Path(tmp) / "requests.json",
+            alert_state_path=Path(tmp) / "alert_state.json",
+        )
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert len(outcomes) == 1
+    assert len(calls) == 1
+    assert "solver statusem feasible" in calls[0]
 
 
 def test_send_planner_alerts_does_not_alert_deferred_far_horizon_ev():

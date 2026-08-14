@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 Changelog:
+- v1.7 (2026-08-14): Accept only optimal correlated replans and stop retrying
+  deterministic solver timeout exits within one WhatsApp request.
 - v1.6 (2026-08-07): Cap one EV request at 9 kWh while retaining the original
   requested energy for audit and explicitly informing the user.
 - v1.5 (2026-08-04): Persist the initial EV schedule notification baseline
@@ -46,10 +48,11 @@ from lib import request_store
 MAX_EV_SESSION_KWH = 9.0
 
 
-VERSION = "1.6"
+VERSION = "1.7"
 
-PLANNER_REPLAN_MAX_ATTEMPTS = 3
+PLANNER_REPLAN_MAX_ATTEMPTS = 2
 PLANNER_REPLAN_RETRY_SECONDS = 5.0
+PLANNER_NONOPTIMAL_EXIT_CODE = 4
 
 PLANNER_DIR = Path(__file__).resolve().parent
 STATE_DIR = PLANNER_DIR / "state"
@@ -464,6 +467,9 @@ def forecast_is_fresh_and_correlated(
         reference = reference.replace(tzinfo=generated_at.tzinfo)
     if generated_at < reference:
         return False
+    solver = forecast.get("solver")
+    if not isinstance(solver, dict) or solver.get("status") != "optimal":
+        return False
     if request_id is not None and forecast_request(forecast, request_id) is None:
         return False
     return True
@@ -518,6 +524,9 @@ def run_planner_replan(
                     paths,
                     verbose=verbose,
                 )
+                if result.returncode == PLANNER_NONOPTIMAL_EXIT_CODE:
+                    log("planner replan stopped after non-optimal solver result", paths, verbose=verbose)
+                    return None
         if attempt < attempts and retry_seconds > 0:
             time.sleep(retry_seconds)
     return None

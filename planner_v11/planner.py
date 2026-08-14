@@ -26,9 +26,13 @@ Vědomá zjednodušení pro v1:
   - Neprobíhá příprava/zápis near-term ECO akcí; to přijde až s executorem a
     adaptéry s read-back verifikací.
 
-VERSION = "1.6"
+VERSION = "1.8"
 
 Changelog:
+- v1.8 (2026-08-14): Report weather-horizon coverage and per-EV-candidate
+  solver timing to make incomplete inputs and timeout cascades explicit.
+- v1.7 (2026-08-08): Preserve the last certified forecast when stage 1/2 is
+  non-optimal and return a failing exit code so forced replans can retry.
 - v1.6 (2026-08-07): Consume the persistent EV session ledger, reserve active
   physical charging to 9 kWh, lock ongoing windows and avoid detector double count.
 - v1.5 (2026-08-04): Notify significant EV recommendation start shifts
@@ -63,7 +67,7 @@ from lib import alerting, boiler_model, boiler_state, economics, ev_model, ev_se
 from lib.config import Config, ConfigError, load_config
 
 
-VERSION = "1.6"
+VERSION = "1.8"
 MODEL_VERSION = "11-planner-v1"
 SCHEMA_VERSION = 10
 EV_SCHEDULE_CHANGE_MINUTES = 60.0
@@ -438,6 +442,17 @@ def build_plan_inputs(
         )
 
     return opt_slots, meta
+
+
+def weather_coverage(meta: list[SlotPlanInput]) -> dict[str, object]:
+    """Summarize whether every planner slot has an hourly weather record."""
+    missing = [slot.slot_start for slot in meta if slot.sun_pct is None or slot.cloudcover_pct is None]
+    return {
+        "complete": not missing,
+        "covered_slots": len(meta) - len(missing),
+        "missing_slots": len(missing),
+        "first_missing_slot": missing[0].isoformat() if missing else None,
+    }
 
 
 def compute_terminal_value_czk_per_kwh(meta: list[SlotPlanInput], cfg: Config) -> float:
@@ -1123,6 +1138,9 @@ def send_planner_alerts(
             state_path=alert_state_path,
             now=now,
         ))
+        # No request feasibility or schedule-change message may be emitted from
+        # a planner run whose final lexicographic result was not certified.
+        return outcomes
 
     if result.ev_unserved_kwh > 1e-6:
         outcomes.append(alerting.notify_once(
@@ -1192,6 +1210,13 @@ def run_planner(
         additional_requests=additional_requests,
         detected_loads=planning_detected_loads,
     )
+    coverage = weather_coverage(meta)
+    if not coverage["complete"]:
+        log(
+            "Neúplné weather pokrytí: "
+            f"missing_slots={coverage['missing_slots']}, first_missing={coverage['first_missing_slot']}",
+            verbose=verbose,
+        )
     terminal_value = compute_terminal_value_czk_per_kwh(meta, cfg)
     initial_soc = soc_pct_to_kwh(float(live_state["battery_soc"]), cfg)
 
@@ -1214,6 +1239,19 @@ def run_planner(
         boiler_opportunistic_daily_limits_kwh=boiler_daily_limits,
     )
     planner_duration_seconds = time.monotonic() - started_monotonic
+    if result.status != "optimal":
+        send_planner_alerts(now=now, cfg=cfg, result=result, active_requests=active_summary)
+        log(
+            f"Neoptimální solver status={result.status}; poslední certifikovaný forecast zůstává beze změny "
+            f"(duration={planner_duration_seconds:.1f}s)",
+            verbose=verbose,
+        )
+        return {
+            "solver": {"name": "PuLP+CBC", "status": result.status},
+            "published": False,
+            "planner_duration_seconds": planner_duration_seconds,
+            "weather_coverage": coverage,
+        }
     valid_until = now + timedelta(minutes=cfg.system.plan_max_age_minutes)
     doc = build_forecast_document(
         generated_at=now,
@@ -1232,6 +1270,7 @@ def run_planner(
     )
     alert_outcomes = send_planner_alerts(now=now, cfg=cfg, result=result, active_requests=active_summary)
     doc["alerts"] = alert_outcomes
+    doc["diagnostics"]["weather_coverage"] = coverage
     atomic_write_json(output_path, doc)
     log(f"Zapsáno {output_path} ({len(doc['slots'])} slotů, status={result.status}, duration={planner_duration_seconds:.1f}s)", verbose=verbose)
     return doc
@@ -1286,13 +1325,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 3
 
-    run_planner(
+    doc = run_planner(
         cfg=cfg,
         now=now,
         live_state=live_state,
         output_path=Path(args.output),
         verbose=args.verbose,
     )
+    if doc.get("solver", {}).get("status") != "optimal" or doc.get("published") is False:
+        return 4
     log("=== planner.py v11 konec ===", verbose=args.verbose)
     return 0
 

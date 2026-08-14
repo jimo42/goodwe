@@ -11,7 +11,7 @@ Zdrojová data na serveru (ověřeno ssh průzkumem, viz lib/paths.py docstring)
         HODINOVĚ (jeden řádek na hodinu, ~24-25 řádků/den vč. headeru),
         generováno weather-forecast/download-weather.py (Open-Meteo +
         astral), přepisováno každou hodinu (`55 * * * *` v crontabu) s
-        horizontem 48 hodin dopředu.
+        horizontem tří kalendářních dnů dopředu (od 2026-08-14).
 
 Rozsah tohoto modulu (MUST):
   - Čtení hodinových záznamů pro daný den.

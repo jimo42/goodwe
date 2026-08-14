@@ -76,7 +76,13 @@ def _make_status_script(root: Path) -> Path:
     return script
 
 
-def _make_planner_script(root: Path, *, fail_first: bool = False, correlated: bool = True) -> Path:
+def _make_planner_script(
+    root: Path,
+    *,
+    fail_first: bool = False,
+    correlated: bool = True,
+    exit_code: int = 0,
+) -> Path:
     script = root / "planner.py"
     script.write_text(
         "#!/usr/bin/env python3\n"
@@ -88,6 +94,8 @@ def _make_planner_script(root: Path, *, fail_first: bool = False, correlated: bo
         "count_path.write_text(str(count), encoding='utf-8')\n"
         f"if {fail_first!r} and count == 1:\n"
         "    raise SystemExit(3)\n"
+        f"if {exit_code!r}:\n"
+        f"    raise SystemExit({exit_code!r})\n"
         "request_doc = json.loads((root / 'requests.json').read_text(encoding='utf-8'))\n"
         "request = [item for item in request_doc['requests'] if item.get('status') == 'active'][-1]\n"
         f"request_id = request.get('id') if {correlated!r} else 'different-request'\n"
@@ -524,6 +532,51 @@ def test_replan_rejects_fresh_but_uncorrelated_forecast():
             retry_seconds=0,
         )
         assert result is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_forecast_correlation_rejects_nonoptimal_solver_status():
+    now = datetime.now().astimezone()
+    forecast = {
+        "generated_at": now.isoformat(),
+        "solver": {"status": "feasible"},
+        "active_requests": [{"id": "ev-1", "type": "ev_charge"}],
+    }
+    assert worker.forecast_is_fresh_and_correlated(
+        forecast,
+        not_before=now - timedelta(seconds=1),
+        request_id="ev-1",
+    ) is False
+
+
+def test_replan_does_not_retry_nonoptimal_solver_exit():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_planner_script(root, exit_code=worker.PLANNER_NONOPTIMAL_EXIT_CODE),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        result = worker.run_planner_replan(
+            paths,
+            request_id="ev-1",
+            not_before=datetime.now().astimezone() - timedelta(seconds=1),
+            verbose=False,
+            max_attempts=3,
+            retry_seconds=0,
+        )
+        assert result is None
+        assert (root / "planner-count.txt").read_text(encoding="utf-8") == "1"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
