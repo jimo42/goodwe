@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib import boiler_state, economics, relay, telemetry  # noqa: E402
-from lib.config import parse_config_dict  # noqa: E402
+from lib.config import ConfigError, parse_config_dict  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.toml"
@@ -236,3 +236,145 @@ def test_executor_rejects_unverified_adapter_result():
 def test_gas_heat_value_is_authoritative_economics_value():
     cfg = _cfg()
     assert economics.gas_heat_value_czk_per_kwh(cfg) == 2.46
+
+
+def _probe_live(*, pv_kw=4.0, grid_kw=0.0, battery_kw=0.0):
+    return {
+        "ppv1": pv_kw * 500, "ppv2": pv_kw * 500,
+        "meter_active_power_total": grid_kw * 1000, "pbattery1": battery_kw * 1000,
+        "igrid1": 4.0, "igrid2": 4.5, "igrid3": 5.0,
+        "load_p1": 800, "load_p2": 900, "load_p3": 1000,
+    }
+
+
+def _probe_telemetry(delivery=(0.0, 0.0, 0.0), *, fresh=True):
+    return {
+        "status": "OK", "latest_age_seconds": 0.0 if fresh else 999.0,
+        "reconstructed_pre_boiler_surplus_kw": 0.0,
+        "confirmed_phase_delivery_kw": list(delivery),
+        "robust_phase_baseline_kw": [0.8, 0.9, 1.0],
+    }
+
+
+def _zero_export():
+    return {"status": "read_ok", "enabled": True, "limit_w": 0.0, "zero_export_active": True}
+
+
+def _probe_cfg():
+    return _cfg({"boiler": {"curtailment_probe_enabled": True}})
+
+
+def test_curtailment_probe_starts_exactly_one_safe_phase_only_after_zero_export_readback():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    transition = executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), now=now, cfg=cfg,
+    )
+    assert transition["kind"] == "start"
+    assert sum(transition["target_mask"]) == 1
+    assert transition["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_STARTED"
+    assert executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
+        ledger=boiler_state.empty_state(), export_limit_state={"zero_export_active": False}, now=now, cfg=cfg,
+    ) is None
+
+
+def test_curtailment_probe_does_not_compete_with_normal_growth_or_hard_request():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    kwargs = {
+        "current_mask": (False, False, False), "live_state": _probe_live(),
+        "telemetry_evidence": _probe_telemetry(), "ledger": boiler_state.empty_state(),
+        "export_limit_state": _zero_export(), "now": now, "cfg": cfg,
+    }
+    assert executor.curtailment_probe_transition(requested_phases=1, hard_active=False, **kwargs) is None
+    assert executor.curtailment_probe_transition(requested_phases=0, hard_active=True, **kwargs) is None
+
+
+def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_import_or_discharge():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 5, tzinfo=ZoneInfo(cfg.system.timezone))
+    state = boiler_state.empty_state()
+    state["curtailment_probe"].update({
+        "status": "observing", "observe_after": now.isoformat(),
+        "previous_mask": [False, False, False], "probed_mask": [True, False, False], "baseline_pv_kw": 2.0,
+    })
+    accepted = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+    )
+    assert accepted["kind"] == "accept"
+    imported = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.2), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+    )
+    assert imported["kind"] == "rollback"
+    discharged = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0, battery_kw=0.2), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+    )
+    assert discharged["kind"] == "rollback"
+
+
+def test_curtailment_probe_blocks_stale_data_and_cancels_when_relay_mask_changes():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    assert executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(), telemetry_evidence=_probe_telemetry(fresh=False),
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), now=now, cfg=cfg,
+    ) is None
+    state = boiler_state.empty_state()
+    state["curtailment_probe"].update({
+        "status": "observing", "observe_after": (now + timedelta(minutes=5)).isoformat(),
+        "previous_mask": [False, False, False], "probed_mask": [True, False, False],
+    })
+    changed = executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
+        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+    )
+    assert changed["kind"] == "cancel"
+    assert changed["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_RELAY_MASK_CHANGED"
+
+
+def test_curtailment_probe_persists_only_after_verified_relay_target_and_sets_cooldown():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    start = {"kind": "start", "target_mask": (True, False, False), "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_STARTED", "evidence": {"baseline_pv_kw": 4.0}}
+    failed = executor.finalize_curtailment_probe(
+        boiler_state.empty_state(), transition=start,
+        decision={"status": "relay_write_verification_failed", "current_mask": [False, False, False]},
+        confirmed_mask=(False, False, False), now=now, cfg=cfg,
+    )
+    assert failed["curtailment_probe"]["status"] == "idle"
+    observing = executor.finalize_curtailment_probe(
+        boiler_state.empty_state(), transition=start,
+        decision={"status": "relay_written", "current_mask": [False, False, False]},
+        confirmed_mask=(True, False, False), now=now, cfg=cfg,
+    )
+    assert observing["curtailment_probe"]["status"] == "observing"
+    rolled_back = executor.finalize_curtailment_probe(
+        observing, transition={"kind": "rollback", "target_mask": (False, False, False), "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_ROLLED_BACK"},
+        decision={"status": "relay_written"}, confirmed_mask=(False, False, False), now=now + timedelta(minutes=5), cfg=cfg,
+    )
+    assert rolled_back["curtailment_probe"]["status"] == "idle"
+    assert rolled_back["curtailment_probe"]["cooldown_until"] is not None
+
+
+def test_curtailment_probe_observe_must_not_undercut_minimum_on_time():
+    with open(CONFIG_PATH, "rb") as handle:
+        raw = copy.deepcopy(tomllib.load(handle))
+    raw["boiler"]["curtailment_probe_observe_minutes"] = 4
+    try:
+        parse_config_dict(raw)
+    except ConfigError as exc:
+        assert "curtailment_probe_observe_minutes musí být >= minimum_on_minutes" in str(exc)
+    else:
+        raise AssertionError("invalid probe observe duration was accepted")

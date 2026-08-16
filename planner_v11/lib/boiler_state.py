@@ -1,8 +1,10 @@
 """Atomic boiler command/delivery ledger shared by planner and executor.
 
-VERSION = "1.2"
+ VERSION = "1.3"
 
 Changelog:
+- v1.3 (2026-08-16): Persist bounded zero-export boiler probe state so an
+  executor restart cannot skip the mandatory observe-or-rollback step.
 - v1.2 (2026-08-10): Persist daily thermostat-stop observation and completion
   notification metadata alongside the existing delivery ledger.
 - v1.1 (2026-08-02): Split accounting at local midnight and cap stale
@@ -18,7 +20,7 @@ from typing import Any, Optional
 
 from .telemetry import MinuteSample
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 
 def empty_state() -> dict[str, Any]:
@@ -31,6 +33,18 @@ def empty_state() -> dict[str, Any]:
         "phase_last_on_at": [None, None, None],
         "phase_last_off_at": [None, None, None],
         "phase_baseline_kw": [None, None, None],
+        "curtailment_probe": {
+            "status": "idle",
+            "started_at": None,
+            "observe_after": None,
+            "previous_mask": None,
+            "probed_mask": None,
+            "baseline_grid_kw": None,
+            "baseline_battery_kw": None,
+            "baseline_pv_kw": None,
+            "cooldown_until": None,
+            "last_result": None,
+        },
         "days": {},
     }
 
@@ -44,6 +58,13 @@ def normalize_state(raw: Any) -> dict[str, Any]:
     for key in ("current_mask", "phase_last_changed_at", "phase_last_on_at", "phase_last_off_at", "phase_baseline_kw"):
         if not isinstance(state.get(key), list) or len(state[key]) != 3:
             state[key] = empty_state()[key]
+    probe = state.get("curtailment_probe")
+    if not isinstance(probe, dict):
+        state["curtailment_probe"] = empty_state()["curtailment_probe"]
+    else:
+        normalized_probe = empty_state()["curtailment_probe"]
+        normalized_probe.update(probe)
+        state["curtailment_probe"] = normalized_probe
     return state
 
 

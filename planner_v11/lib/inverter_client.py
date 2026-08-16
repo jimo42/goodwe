@@ -1,9 +1,11 @@
 """
 GoodWe adapter helpers for planner_v10.
 
-VERSION = "1.1"
+ VERSION = "1.2"
 
 Changelog:
+- v1.2 (2026-08-16): Add a read-only GoodWe export-limit state adapter for
+  the executor's bounded curtailment probe; it owns no settings writes.
 - v1.0 (2026-07-22): Low-level ECO schedule encoder/writer copied from the
   already verified v8 adapter pattern. The module does not decide *when* to
   write; it only provides a guarded 12-byte ECO write with read-back check.
@@ -26,7 +28,7 @@ from typing import Any
 from . import paths
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 GOODWE_LIB_DIR = os.path.join(paths.BASE_DIR, "goodwe", "goodwe")
 GOODWE_CONF_PATH = os.path.join(paths.BASE_DIR, "conf", "goodwe.conf")
@@ -61,6 +63,20 @@ async def read_runtime_data() -> dict[str, Any]:
         if sensor.id_ in data:
             out[sensor.id_] = data[sensor.id_]
     return out
+
+
+async def read_export_limit_state() -> dict[str, Any]:
+    """Read (never write) the inverter's externally owned export limit state."""
+    inverter = await connect()
+    enabled = await inverter.read_setting("grid_export")
+    limit_w = await inverter.get_grid_export_limit()
+    enabled_bool = bool(enabled == 1)
+    return {
+        "status": "read_ok",
+        "enabled": enabled_bool,
+        "limit_w": float(limit_w),
+        "zero_export_active": enabled_bool and abs(float(limit_w)) <= 1.0,
+    }
 
 
 def encode_schedule(

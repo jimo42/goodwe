@@ -144,6 +144,12 @@ class BoilerConfig:
     minimum_on_minutes: float
     minimum_off_minutes: float
     rebalance_hysteresis_kw: float
+    curtailment_probe_enabled: bool
+    curtailment_probe_observe_minutes: float
+    curtailment_probe_cooldown_minutes: float
+    curtailment_probe_import_tolerance_kw: float
+    curtailment_probe_battery_discharge_tolerance_kw: float
+    curtailment_probe_min_pv_response_kw: float
 
 
 @dataclass(frozen=True)
@@ -401,9 +407,27 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
         minimum_on_minutes=v.get("minimum_on_minutes", (int, float), min_value=0) or 5.0,
         minimum_off_minutes=v.get("minimum_off_minutes", (int, float), min_value=0) or 5.0,
         rebalance_hysteresis_kw=v.get("rebalance_hysteresis_kw", (int, float), min_value=0) or 0.0,
+        curtailment_probe_enabled=v.get("curtailment_probe_enabled", bool),
+        curtailment_probe_observe_minutes=v.get(
+            "curtailment_probe_observe_minutes", (int, float), min_value=1) or 5.0,
+        curtailment_probe_cooldown_minutes=v.get(
+            "curtailment_probe_cooldown_minutes", (int, float), min_value=0) or 0.0,
+        curtailment_probe_import_tolerance_kw=v.get(
+            "curtailment_probe_import_tolerance_kw", (int, float), min_value=0) or 0.0,
+        curtailment_probe_battery_discharge_tolerance_kw=v.get(
+            "curtailment_probe_battery_discharge_tolerance_kw", (int, float), min_value=0) or 0.0,
+        curtailment_probe_min_pv_response_kw=v.get(
+            "curtailment_probe_min_pv_response_kw", (int, float), min_value=0) or 0.0,
     )
     for k in v.unknown_keys():
         errors.append(f"[boiler.{k}] neznámý klíč")
+    if not errors_contain(errors, "boiler."):
+        # A rollback is only allowed after the added phase has completed its
+        # normal minimum-on dwell time.
+        if boiler.curtailment_probe_observe_minutes < boiler.minimum_on_minutes:
+            errors.append(
+                "[boiler] curtailment_probe_observe_minutes musí být >= minimum_on_minutes"
+            )
 
     # --- alerts ---
     v = _SectionValidator("alerts", raw.get("alerts"), errors)

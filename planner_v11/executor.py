@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v3.0 (2026-08-16): Add a persisted, read-only-gated zero-export boiler
+  probe-and-observe. It adds one phase at most, then accepts or rolls it back
+  only after a fresh minimum-on-compatible measurement window.
 - v2.9 (2026-08-10): Interpolate planned SoC within the current slot, include
   actual SoC in deviation alerts, deduplicate changing residual values, and send
   retry-safe boiler-full and EV-session-closed completion notifications.
@@ -67,7 +70,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "2.9"
+VERSION = "3.0"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -502,6 +505,179 @@ def additional_current_for_boiler_phase(cfg: Config) -> float:
     return cfg.boiler.phase_power_kw * 1000.0 / cfg.grid.phase_nominal_voltage_v
 
 
+def read_export_limit_state() -> dict:
+    """Read the external export-limit owner without ever modifying it."""
+    try:
+        return asyncio.run(inverter_client.read_export_limit_state())
+    except Exception as exc:  # An unreadable setting disables the probe fail-safe.
+        return {"status": "read_failed", "zero_export_active": False, "error": str(exc)}
+
+
+def _live_kw(live_state: dict, key: str) -> Optional[float]:
+    try:
+        return float(live_state[key]) / 1000.0
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _probe_state(ledger: dict) -> dict:
+    return boiler_state.normalize_state(ledger).get("curtailment_probe", {})
+
+
+def _probe_fresh(telemetry_evidence: dict, cfg: Config) -> bool:
+    try:
+        return (
+            telemetry_evidence.get("status") == "OK"
+            and float(telemetry_evidence["latest_age_seconds"])
+            <= cfg.system.execution_step_minutes * 60.0
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _probe_one_additional_mask(
+    *, current_mask: tuple[bool, bool, bool], live_state: dict, ledger: dict, now: datetime, cfg: Config,
+) -> tuple[Optional[tuple[bool, bool, bool]], dict]:
+    """Choose exactly one currently-off safe phase; never rebalance in a probe."""
+    add_a = additional_current_for_boiler_phase(cfg)
+    last_off = ledger.get("phase_last_off_at", [None, None, None])
+    candidates = []
+    for idx, phase in enumerate(PHASE_ORDER):
+        if current_mask[idx] or _minutes_since(last_off[idx], now) < cfg.boiler.minimum_off_minutes:
+            continue
+        current_a = phase_current_from_live(live_state, phase, cfg)
+        if current_a is None or current_a + add_a > cfg.grid.soft_phase_limit_a:
+            continue
+        candidates.append((current_a, idx))
+    if not candidates:
+        return None, {"reason": "NO_SAFE_ADDITIONAL_PHASE", "additional_current_a": add_a}
+    current_a, idx = min(candidates)
+    target = list(current_mask)
+    target[idx] = True
+    return tuple(target), {
+        "reason": "ONE_SAFE_ADDITIONAL_PHASE", "phase": PHASE_ORDER[idx],
+        "measured_current_a": round(current_a, 6), "additional_current_a": round(add_a, 6),
+    }
+
+
+def curtailment_probe_transition(
+    *, current_mask: tuple[bool, bool, bool], requested_phases: int, hard_active: bool,
+    live_state: dict, telemetry_evidence: dict, ledger: dict, export_limit_state: dict,
+    now: datetime, cfg: Config,
+) -> Optional[dict]:
+    """Return a bounded zero-export probe action, or ``None`` for normal control.
+
+    The external GoodWe setting must be read back as enabled with a 0 W limit.
+    Positive ``pbattery1`` is discharge (verified in the executor's existing
+    GoodWe sign convention); a discharge above tolerance rejects the probe.
+    """
+    if not cfg.boiler.curtailment_probe_enabled or hard_active:
+        return None
+    state = _probe_state(ledger)
+    status = state.get("status")
+    probed = state.get("probed_mask")
+    previous = state.get("previous_mask")
+    if status == "observing":
+        if not (isinstance(probed, list) and len(probed) == 3 and isinstance(previous, list) and len(previous) == 3):
+            return {"kind": "cancel", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_INVALID_STATE"}
+        probed_mask = tuple(bool(value) for value in probed)
+        previous_mask = tuple(bool(value) for value in previous)
+        if current_mask != probed_mask:
+            return {"kind": "cancel", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_RELAY_MASK_CHANGED"}
+        observe_after = _parse_optional_datetime(state.get("observe_after"), ZoneInfo(cfg.system.timezone))
+        if observe_after is None or now < observe_after:
+            return {"kind": "hold", "target_mask": probed_mask, "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_OBSERVING"}
+        pv1_kw, pv2_kw = _live_kw(live_state, "ppv1"), _live_kw(live_state, "ppv2")
+        grid_kw = _live_kw(live_state, "meter_active_power_total")
+        battery_kw = _live_kw(live_state, "pbattery1")
+        baseline_pv = state.get("baseline_pv_kw")
+        delivery = telemetry_evidence.get("confirmed_phase_delivery_kw")
+        added = [idx for idx, (before, after) in enumerate(zip(previous_mask, probed_mask)) if after and not before]
+        delivered = (
+            isinstance(delivery, list) and len(added) == 1 and len(delivery) == 3
+            and float(delivery[added[0]] or 0.0) >= 1.0
+        )
+        pv_response = None if pv1_kw is None or pv2_kw is None or baseline_pv is None else pv1_kw + pv2_kw - float(baseline_pv)
+        accepted = (
+            _probe_fresh(telemetry_evidence, cfg)
+            and grid_kw is not None and grid_kw >= -cfg.boiler.curtailment_probe_import_tolerance_kw
+            and battery_kw is not None and battery_kw <= cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw
+            and pv_response is not None and pv_response >= cfg.boiler.curtailment_probe_min_pv_response_kw
+            and delivered
+        )
+        evidence = {
+            "grid_kw": grid_kw, "battery_kw": battery_kw, "pv_response_kw": pv_response,
+            "added_phase_delivery_confirmed": delivered, "telemetry_fresh": _probe_fresh(telemetry_evidence, cfg),
+        }
+        return {
+            "kind": "accept" if accepted else "rollback",
+            "target_mask": probed_mask if accepted else previous_mask,
+            "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_ACCEPTED" if accepted else "BOILER_EXPORT_CURTAILMENT_PROBE_ROLLED_BACK",
+            "evidence": evidence,
+        }
+    cooldown_until = _parse_optional_datetime(state.get("cooldown_until"), ZoneInfo(cfg.system.timezone))
+    if cooldown_until is not None and now < cooldown_until:
+        return {"kind": "cooldown", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_COOLDOWN"}
+    if requested_phases > sum(current_mask):
+        return None
+    if not export_limit_state.get("zero_export_active") or not _probe_fresh(telemetry_evidence, cfg):
+        return None
+    grid_kw = _live_kw(live_state, "meter_active_power_total")
+    battery_kw = _live_kw(live_state, "pbattery1")
+    pv1_kw, pv2_kw = _live_kw(live_state, "ppv1"), _live_kw(live_state, "ppv2")
+    if (
+        grid_kw is None or battery_kw is None or pv1_kw is None or pv2_kw is None
+        or grid_kw < -cfg.boiler.curtailment_probe_import_tolerance_kw
+        or battery_kw > cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw
+        or pv1_kw + pv2_kw < cfg.boiler.curtailment_probe_min_pv_response_kw
+    ):
+        return None
+    target_mask, phase_evidence = _probe_one_additional_mask(
+        current_mask=current_mask, live_state=live_state, ledger=ledger, now=now, cfg=cfg,
+    )
+    if target_mask is None:
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_NO_SAFE_PHASE", "evidence": phase_evidence}
+    return {
+        "kind": "start", "target_mask": target_mask,
+        "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_STARTED",
+        "evidence": {
+            **phase_evidence, "baseline_grid_kw": grid_kw, "baseline_battery_kw": battery_kw,
+            "baseline_pv_kw": round(pv1_kw + pv2_kw, 6), "export_limit": export_limit_state,
+        },
+    }
+
+
+def finalize_curtailment_probe(
+    ledger: dict, *, transition: Optional[dict], decision: dict, confirmed_mask: tuple[bool, bool, bool], now: datetime, cfg: Config,
+) -> dict:
+    """Persist probe state only after the relay read-back confirms its target."""
+    ledger = boiler_state.normalize_state(ledger)
+    if not transition:
+        return ledger
+    probe = ledger["curtailment_probe"]
+    kind = transition.get("kind")
+    target = tuple(bool(value) for value in transition.get("target_mask", confirmed_mask))
+    written = decision.get("status") == "relay_written" and confirmed_mask == target
+    cooldown = (now + timedelta(minutes=cfg.boiler.curtailment_probe_cooldown_minutes)).isoformat()
+    if kind == "start" and written:
+        evidence = transition.get("evidence", {})
+        probe.update({
+            "status": "observing", "started_at": now.isoformat(),
+            "observe_after": (now + timedelta(minutes=cfg.boiler.curtailment_probe_observe_minutes)).isoformat(),
+            "previous_mask": decision.get("current_mask"), "probed_mask": list(target),
+            "baseline_grid_kw": evidence.get("baseline_grid_kw"), "baseline_battery_kw": evidence.get("baseline_battery_kw"),
+            "baseline_pv_kw": evidence.get("baseline_pv_kw"), "last_result": transition.get("reason"),
+        })
+    elif kind in ("accept", "rollback") and written:
+        probe.update({
+            "status": "idle", "cooldown_until": cooldown, "last_result": transition.get("reason"),
+            "last_evidence": transition.get("evidence", {}),
+        })
+    elif kind == "cancel":
+        probe.update({"status": "idle", "cooldown_until": cooldown, "last_result": transition.get("reason")})
+    return ledger
+
+
 def safe_boiler_phases_by_headroom(
     planned_phases: int, live_state: dict, cfg: Config
 ) -> tuple[int, list[str], dict]:
@@ -683,6 +859,7 @@ def decide_boiler_execution(
     now: Optional[datetime] = None,
     telemetry_evidence: Optional[dict] = None,
     ledger: Optional[dict] = None,
+    export_limit_state: Optional[dict] = None,
 ) -> dict:
     now = now or datetime.now(ZoneInfo(cfg.system.timezone))
     telemetry_evidence = telemetry_evidence or {}
@@ -736,8 +913,28 @@ def decide_boiler_execution(
         target_phases=requested, current_mask=current_mask, baseline_kw=baseline, ledger=ledger, now=now, cfg=cfg,
     )
     reasons = (["BOILER_HARD_MINIMUM"] if hard_active else []) + ["BOILER_REALTIME_ECONOMIC_EVALUATED"] + mask_reasons
+    probe_transition = curtailment_probe_transition(
+        current_mask=current_mask,
+        requested_phases=requested,
+        hard_active=hard_active,
+        live_state=live_state,
+        telemetry_evidence=telemetry_evidence,
+        ledger=ledger,
+        export_limit_state=export_limit_state or {"status": "not_read", "zero_export_active": False},
+        now=now,
+        cfg=cfg,
+    )
+    if probe_transition and probe_transition.get("kind") in ("start", "hold", "accept", "rollback"):
+        target_mask = tuple(bool(value) for value in probe_transition["target_mask"])
+        reasons.append(probe_transition["reason"])
+    elif probe_transition:
+        reasons.append(probe_transition["reason"])
     safe = sum(target_mask)
-    evidence = {"telemetry": telemetry_evidence, "economics": economics_result, "phases": phase_evidence, "robust_phase_baseline_kw": baseline}
+    evidence = {
+        "telemetry": telemetry_evidence, "economics": economics_result, "phases": phase_evidence,
+        "robust_phase_baseline_kw": baseline, "export_limit": export_limit_state or {},
+        "curtailment_probe": probe_transition or {"kind": "not_applicable"},
+    }
     if cfg.system.dry_run or not cfg.system.boiler_write_enabled:
         return {
             "planned_phases": planned,
@@ -1188,6 +1385,9 @@ def run_executor(
     )
     boiler_completion = detect_boiler_full_completion(ledger, telemetry_evidence, now=now)
     ledger["boiler_full_completion"] = boiler_completion
+    export_limit_state = read_export_limit_state() if forecast_valid else {
+        "status": "not_read_invalid_forecast", "zero_export_active": False,
+    }
     battery_failure = update_device_failure_counter(
         "battery_eco", battery_decision.get("status") not in ("eco_write_failed", "eco_write_verification_failed"), now=now,
     )
@@ -1201,6 +1401,7 @@ def run_executor(
         now=now,
         telemetry_evidence=telemetry_evidence,
         ledger=ledger,
+        export_limit_state=export_limit_state,
     )
     relay_cycle_healthy = (
         relay_health.get("relay_status_ok") is True
@@ -1221,6 +1422,14 @@ def run_executor(
             confirmed_mask_source = "verified_target"
     ledger = boiler_state.record_mask_transition(
         ledger, old_mask=accounting_mask, new_mask=confirmed_post_mask, now=now,
+    )
+    ledger = finalize_curtailment_probe(
+        ledger,
+        transition=(boiler_decision.get("evidence", {}).get("curtailment_probe") if isinstance(boiler_decision.get("evidence"), dict) else None),
+        decision=boiler_decision,
+        confirmed_mask=confirmed_post_mask,
+        now=now,
+        cfg=cfg,
     )
     ledger["current_mask_source"] = confirmed_mask_source
     atomic_write_json(boiler_state_path, ledger)
@@ -1266,6 +1475,7 @@ def run_executor(
         telemetry_evidence=telemetry_evidence,
         ev_charging_session=session_state,
     )
+    runtime["export_limit"] = export_limit_state
     runtime["ev_session_replan"] = session_replan
     runtime["device_failures"] = {"relay": relay_failure, "battery_eco": battery_failure}
     runtime["alerts"] = send_executor_alerts(

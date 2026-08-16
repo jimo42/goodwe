@@ -1,3 +1,24 @@
+## Zero-export curtailment boiler probe v3.0 (nasazeno 2026-08-16)
+
+- Audit okna 15. 8. 2026 10:30–16:30 potvrdil implementační mezeru: při
+  externím zero-export curtailmentu `robust_evidence()` nevidí latentní PV
+  rezervu další fáze. Nízké `ppv` není samostatný důkaz; provozní závěr musí
+  kombinovat read-back export limitu, grid flow, baterii/SOC a forecast/počasí.
+- `executor.py 3.0`, `lib/config.py`, `lib/boiler_state.py`,
+  `lib/inverter_client.py` a `tests/test_boiler_redesign.py` přidávají
+  perzistentní, bounded probe-and-observe. Adapter export limit pouze čte;
+  executor nepřebírá vlastnictví ani nezapisuje GoodWe export control.
+- Start vyžaduje GoodWe `grid_export=enabled`, limit 0 W, fresh telemetry,
+  relay health, headroom, bez hard požadavku a bez normálního růstu. Přidá
+  přesně jednu vypnutou fázi; po okně >= `minimum_on_minutes` ji přijme pouze
+  při potvrzené dodávce >=1 kW, PV odezvě, importu/battery discharge v
+  toleranci. Jinak read-backem ověřeně vrátí původní masku a nastaví cooldown.
+- Produkční konfigurace ponechává `curtailment_probe_enabled=false`; nasazení
+  tedy nezahájilo žádný reálný probe. Jeho budoucí aktivace vyžaduje samostatné
+  explicitní provozní rozhodnutí a následné pozorování history/runtime.
+- Staging preflight i post-deploy produkční full suite: **228/228 passed** na
+  Pythonu 3.13. Záloha: `planner_v11/backups/20260816_094049_curtailment_probe_v3`.
+
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
 Aktualizováno: **2026-08-10 17:13 CEST**
