@@ -1,3 +1,18 @@
+## Curtailment probe v3.0 aktivován (2026-08-16 10:54 CEST)
+
+- Po výslovném schválení byl v ignorovaném produkčním `planner_v11/config.toml`
+  změněn pouze `curtailment_probe_enabled = true`. Záloha konfigurace:
+  `planner_v11/backups/20260816_105439_curtailment_probe_activation_config.toml`.
+- Preflight read-back GoodWe před aktivací: `grid_export` byl disabled, limit 0 W,
+  tedy `zero_export_active=false`; executor externí export-control neměnil.
+- První periodický executor po aktivaci v 10:58 CEST načetl runtime a bezpečně
+  skončil `BOILER_FAILSAFE_OFF` kvůli invalidnímu forecastu. Relé zůstalo 0000,
+  `curtailment_probe.status=idle` a neexistuje žádný STARTED/ACCEPTED/ROLLED_BACK
+  záznam. To je očekávaný fail-safe, nikoli provedený experiment.
+- Cron executoru je každých 5 minut (`3-58/5 * * * *`). Sledovat runtime
+  `export_limit`, `boiler_control_ledger.curtailment_probe` a historii. Reálný
+  probe je možný výhradně při platném forecastu a read-backu enabled + 0 W.
+
 ## Zero-export curtailment boiler probe v3.0 (nasazeno 2026-08-16)
 
 - Audit okna 15. 8. 2026 10:30–16:30 potvrdil implementační mezeru: při
