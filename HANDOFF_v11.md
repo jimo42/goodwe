@@ -36,7 +36,31 @@
 
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-09-04 00:25 CEST**
+## 0. Nepřekročitelné pravidlo pro vzdálené příkazy na `homeserver`
+
+**Nikdy neposílat vícekrokové SSH one-linery.** Nepoužívat `&&`, `;`, pipelines
+`|`, subshells ``$(...)``, here-doc shell skládání ani jiná řetězení v příkazu
+typu `ssh homeserver '...'`. Lokální PowerShell to opakovaně rozbíjí a vede k
+matoucím, neúplným nebo předčasně spuštěným krokům.
+
+Povolený tvar vzdálené operace je vždy jeden atomický příkaz, například:
+
+```text
+ssh homeserver 'python3 /tmp/audit_or_deploy_step.py'
+```
+
+Pokud je potřeba více kroků na serveru, postup je povinně:
+
+1. připravit lokálně jednoúčelový `.py` skript,
+2. nahrát ho přes samostatné `scp`,
+3. spustit ho jedním `ssh homeserver 'python3 /cesta/skript.py'`,
+4. ve skriptu používat `subprocess.run([...], shell=False)`, ne shellové řetězení.
+
+Toto pravidlo platí i pro zdánlivě neškodné kontroly typu `git status` +
+`git log` + inspekční skript: buď samostatné neřetězené příkazy, nebo jeden
+server-side audit skript. Při pochybnosti skript, ne one-liner.
+
+Aktualizováno: **2026-09-04 00:35 CEST**
 
 ## Update 2026-09-04 — EV PV-rich candidate prefilter nasazen na produkci
 
