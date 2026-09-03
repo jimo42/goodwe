@@ -26,9 +26,13 @@ Vědomá zjednodušení pro v1:
   - Neprobíhá příprava/zápis near-term ECO akcí; to přijde až s executorem a
     adaptéry s read-back verifikací.
 
-VERSION = "1.8"
+VERSION = "1.10"
 
 Changelog:
+- v1.10 (2026-09-04): Include PV-rich EV windows in the candidate prefilter so
+  later sunny windows are not excluded before full MILP evaluation.
+- v1.9 (2026-08-23): Forward the GoodWe battery-power sensor to the executor's
+  read-only zero-export boiler-probe safety gate.
 - v1.8 (2026-08-14): Report weather-horizon coverage and per-EV-candidate
   solver timing to make incomplete inputs and timeout cascades explicit.
 - v1.7 (2026-08-08): Preserve the last certified forecast when stage 1/2 is
@@ -67,7 +71,7 @@ from lib import alerting, boiler_model, boiler_state, economics, ev_model, ev_se
 from lib.config import Config, ConfigError, load_config
 
 
-VERSION = "1.8"
+VERSION = "1.10"
 MODEL_VERSION = "11-planner-v1"
 SCHEMA_VERSION = 10
 EV_SCHEDULE_CHANGE_MINUTES = 60.0
@@ -756,6 +760,7 @@ def choose_requests(
                         cfg,
                         [s.price_import_czk_kwh for s in opt_slots],
                         evaluate,
+                        pv_kwh=[s.pv_kwh for s in opt_slots],
                     )
                     chosen_start = rec.recommended_start
                     chosen_end = rec.expected_end

@@ -92,6 +92,15 @@ def test_rank_candidates_sorts_by_cheap_score():
     assert [c.cheap_score_czk_per_kwh for c in ranked] == [1.0, 3.0, 5.0]
 
 
+def test_rank_candidates_by_pv_prefers_pv_rich_window():
+    candidates = [
+        em.EvCandidate(0, 1, _BASE_START, _BASE_START + timedelta(minutes=30), cheap_score_czk_per_kwh=1.0),
+        em.EvCandidate(2, 3, _BASE_START + timedelta(minutes=30), _BASE_START + timedelta(minutes=60), cheap_score_czk_per_kwh=9.0),
+    ]
+    ranked = em.rank_candidates_by_pv(candidates, [0.2, 0.2, 2.0, 2.0])
+    assert ranked[0].start_idx == 2
+
+
 def test_evaluate_candidates_picks_lowest_economic_objective():
     cfg = _cfg()
     candidates = [
@@ -112,6 +121,64 @@ def test_evaluate_candidates_picks_lowest_economic_objective():
     assert best_result.economic_objective_czk == 2.0
 
 
+def test_evaluate_candidates_includes_extra_pv_ranked_candidates():
+    cfg = _cfg()
+    candidates = [
+        em.EvCandidate(0, 0, _BASE_START, _BASE_START + timedelta(minutes=15), cheap_score_czk_per_kwh=1.0),
+        em.EvCandidate(1, 1, _BASE_START + timedelta(minutes=15), _BASE_START + timedelta(minutes=30), cheap_score_czk_per_kwh=2.0),
+        em.EvCandidate(2, 2, _BASE_START + timedelta(minutes=30), _BASE_START + timedelta(minutes=45), cheap_score_czk_per_kwh=9.0),
+    ]
+    calls = []
+
+    def fake_evaluate(req):
+        calls.append(req.window_start_idx)
+        if req.window_start_idx == 2:
+            return OptimizerResult(status="optimal", ev_unserved_kwh=0.0, economic_objective_czk=-5.0)
+        return OptimizerResult(status="optimal", ev_unserved_kwh=0.0, economic_objective_czk=1.0)
+
+    best_candidate, best_result = em.evaluate_candidates(
+        candidates,
+        required_ac_kwh=1.0,
+        cfg=cfg,
+        evaluate_fn=fake_evaluate,
+        max_full_evaluations=1,
+        extra_ranked_candidates=[candidates[2]],
+    )
+    assert calls == [0, 2]
+    assert best_candidate.start_idx == 2
+    assert best_result.economic_objective_czk == -5.0
+
+
+def test_recommend_checks_pv_rich_window_even_when_price_prefilter_is_worse():
+    cfg = _cfg()
+    slot_starts = _slot_starts(4, cfg)
+    available_from = slot_starts[0]
+    deadline = slot_starts[-1] + timedelta(hours=1)
+    required = cfg.ev.planning_power_kw * 0.25
+    prices = [1.0, 2.0, 9.0, 9.0]
+    pv_kwh = [0.0, 0.1, 3.0, 2.0]
+
+    def fake_evaluate(req):
+        if req.window_start_idx == 2:
+            return OptimizerResult(status="optimal", ev_unserved_kwh=0.0, economic_objective_czk=-10.0)
+        return OptimizerResult(status="optimal", ev_unserved_kwh=0.0, economic_objective_czk=10.0)
+
+    rec = em.recommend(
+        slot_starts,
+        available_from,
+        deadline,
+        required,
+        cfg,
+        prices,
+        fake_evaluate,
+        max_full_evaluations=1,
+        pv_kwh=pv_kwh,
+        max_pv_evaluations=1,
+    )
+    assert rec.feasible is True
+    assert rec.recommended_start == slot_starts[2]
+
+
 def test_evaluate_candidates_skips_infeasible_ev_unserved():
     cfg = _cfg()
     candidates = [
@@ -128,6 +195,25 @@ def test_evaluate_candidates_skips_infeasible_ev_unserved():
         candidates, required_ac_kwh=1.0, cfg=cfg, evaluate_fn=fake_evaluate
     )
     assert best_candidate.start_idx == 1
+
+
+def test_evaluate_candidates_skips_nonoptimal_solver_result():
+    cfg = _cfg()
+    candidates = [
+        em.EvCandidate(0, 0, _BASE_START, _BASE_START, cheap_score_czk_per_kwh=1.0),
+        em.EvCandidate(1, 1, _BASE_START, _BASE_START, cheap_score_czk_per_kwh=2.0),
+    ]
+
+    def fake_evaluate(req):
+        if req.window_start_idx == 0:
+            return OptimizerResult(status="feasible", ev_unserved_kwh=0.0, economic_objective_czk=0.0)
+        return OptimizerResult(status="optimal", ev_unserved_kwh=0.0, economic_objective_czk=5.0)
+
+    best_candidate, best_result = em.evaluate_candidates(
+        candidates, required_ac_kwh=1.0, cfg=cfg, evaluate_fn=fake_evaluate
+    )
+    assert best_candidate.start_idx == 1
+    assert best_result.status == "optimal"
 
 
 def test_latest_safe_start_basic():

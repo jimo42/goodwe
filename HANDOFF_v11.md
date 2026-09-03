@@ -36,7 +36,78 @@
 
 # Handoff – produkční plánovač FVE/baterie/bojleru v11 (MILP)
 
-Aktualizováno: **2026-08-10 17:13 CEST**
+Aktualizováno: **2026-09-04 00:25 CEST**
+
+## Update 2026-09-04 — EV PV-rich candidate prefilter nasazen na produkci
+
+- Incident: aktivní EV request `36cd5a03-b841-41df-b89c-62845599c829`
+  (`9.0 kWh`, dostupné od `2026-09-03T23:37:37+02:00`, deadline
+  `2026-09-06T01:00:00+02:00`) měl páteční doporučení, přestože sobotní PV
+  forecast byl vyšší. Root cause: EV candidate prefilter řadil jen podle importní
+  ceny, takže sobotní PV-rich okna s konzervativní fallback cenou se vůbec
+  nedostala do plného MILP ověření.
+- Nasazeno do `/home/automatization/goodwe/planner_v11`:
+  `lib/ev_model.py` nově přidává PV-ranked kandidáty a slučuje je s price-ranked
+  kandidáty bez duplicit; `planner.py 1.10` předává do EV recommendation slotové
+  PV hodnoty; `tests/test_ev_model.py` obsahuje regresní testy pro PV-ranked
+  kandidáty a neoptimální candidate solver status.
+- Produkční backup před deployem:
+  `/home/automatization/goodwe/backups/ev_pv_prefilter_fix_20260904_000533`.
+- Ověření na produkci: `py_compile` pro dotčené soubory prošel; cílené EV testy
+  v izolovaném runneru prošly (`targeted_ev_model_tests_passed`). Ruční produkční
+  `./planner.py --verbose` skončil `RC=0`, `solver.status=optimal`, zapsal
+  `state/forecast_48h.json`, `weather_coverage.complete=true` a v logu již
+  hodnotí 10 EV kandidátů včetně sobotních PV-rich oken.
+- Poznámka k aktuálnímu výsledku: při zjednodušeném EV-only porovnání sobota
+  vychází lépe, ale plná produkční candidate closure zahrnuje oportunistický
+  bojlerový budget. Po započtení bojleru aktuální běh stále ekonomicky preferuje
+  pátek (`2026-09-04T12:00–15:30`) před sobotou, protože sobotní EV okno soupeří
+  o PV s bojlerem. Fix tedy odstraňuje prefilter slepotu vůči PV; samostatné
+  produktové rozhodnutí zůstává, zda má EV dostat vyšší prioritu než oportunistický
+  bojler při porovnávání slunečných oken.
+- Full `tests/run_manual.py` nebyl použit jako deploy gate, protože selhává už na
+  čisté produkční kopii kvůli existujícím nesouvisejícím `test_boiler_redesign.py`
+  regresím; je potřeba je řešit samostatně.
+
+## Kandidát 2026-08-16 — safe zero-export curtailment probe bojleru (**NOT DEPLOYED**)
+
+### Závěr auditu 15. 8. 2026, 10:30–16:30
+
+- `robust_evidence()` rekonstruuje jen stabilní export a již potvrzený odběr
+  bojleru. Při externím GoodWe zero-export curtailmentu proto nevidí latentní
+  rezervu pro další fázi. Nízké `ppv` samo o sobě curtailment nedokazuje; závěr
+  musí kombinovat read-back limitu, grid flow, baterii/SOC, forecast/počasí a
+  následný bezpečný experiment.
+- Odpolední vypnutí bojleru 15. 8. bylo ekonomické rozhodnutí executoru, nikoli
+  ztracené hlášení: termostat plné nahřátí nepotvrdil. Dodáno bylo přibližně
+  2,50 kWh (15:48–16:48 jedna fáze 2 kW, 17:03–17:18 zhruba 0,5 kWh); relé pak
+  vypnul executor.
+
+### Rebasovaný kandidát a bezpečnostní kontrakt
+
+- Kandidát je ručně portován nad čistým read-only snapshotem produkčního HEAD
+  `c899076e85ca10ee3f5f19e1390ff8fa8517d36e` v
+  `remote_staging/prod_20260816_c899076_clean/`; zachovává novější SoC
+  notification a EV-session API. Dřívější stale rebase proto selhal 4× API
+  regresí (223/227), ale tento výsledek již není platný pro nový kandidát.
+- Probe je defaultně vypnutý a nikdy nepřebírá export-control ownership ani
+  nezapisuje exportní limit. Startuje nanejvýš jednu vypnutou bezpečnou fázi jen
+  po read-only GoodWe potvrzení `grid_export=enabled`, limit `0 W`, s čerstvou
+  telemetrií, zdravým relé, bez hard requestu/normal expansion a s headroomem.
+- Observe je validací vynucen alespoň `minimum_on_minutes`. Přijetí vyžaduje
+  potvrzenou dodávku přidané fáze ≥1 kW, reakci PV, import v toleranci, žádné
+  nadlimitní vybíjení baterie a stále čerstvou telemetrii; jinak následuje
+  rollback na původní masku a cooldown. Důvody jsou perzistovány do historie.
+
+### Ověření a další krok
+
+- Na izolovaném serverovém stagingu `/tmp/planner_v11_curtailment_c899076_candidate`
+  prošlo `python3 -m py_compile` a plný `python3 tests/run_manual.py`:
+  **228/228 passed** (Python 3.13).
+- Produkce, její stav, konfigurace i git pracovní strom **nebyly změněny**.
+- Připravený, úmyslně nespouštěný playbook je
+  `remote_staging/deploy_curtailment_probe_c899076_PREPARED_ONLY.sh`. Nasazení
+  vyžaduje nový audit, kontrolu HEAD/hashů, staging test a výslovné schválení.
 
 ## Update 2026-08-10 — notifikační zpřesnění (produkce)
 

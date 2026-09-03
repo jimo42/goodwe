@@ -157,25 +157,78 @@ def rank_candidates(candidates: list[EvCandidate]) -> list[EvCandidate]:
     return sorted(candidates, key=lambda c: c.cheap_score_czk_per_kwh)
 
 
+def rank_candidates_by_pv(
+    candidates: list[EvCandidate], pv_kwh: list[float]
+) -> list[EvCandidate]:
+    """Seřadí kandidáty sestupně podle součtu předpovězené PV v jejich okně.
+
+    Používá se jako druhý levný předvýběr vedle importní ceny. Bez něj se může
+    stát, že pozdější slunečné okno s konzervativní fallback cenou nikdy nedojde
+    do plného MILP ověření, i když by po započtení PV bylo ekonomicky lepší.
+    """
+
+    if not pv_kwh:
+        return []
+
+    def candidate_pv(candidate: EvCandidate) -> float:
+        if candidate.start_idx < 0 or candidate.end_idx >= len(pv_kwh):
+            return -1.0
+        return sum(pv_kwh[candidate.start_idx : candidate.end_idx + 1])
+
+    return sorted(
+        candidates,
+        key=lambda c: (-candidate_pv(c), c.cheap_score_czk_per_kwh, c.start_time),
+    )
+
+
+def merge_candidate_rankings(*ranked_lists: list[EvCandidate]) -> list[EvCandidate]:
+    """Spojí několik předseřazených kandidátních seznamů bez duplicit.
+
+    Pořadí prvního výskytu se zachová. Identita je časové okno/indexy, ne jen
+    start, aby zůstalo bezpečné i pro případ budoucích rozdílných délek profilů.
+    """
+
+    merged: list[EvCandidate] = []
+    seen: set[tuple[int, int, datetime, datetime]] = set()
+    for ranked in ranked_lists:
+        for candidate in ranked:
+            key = (
+                candidate.start_idx,
+                candidate.end_idx,
+                candidate.start_time,
+                candidate.end_time,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+    return merged
+
+
 def evaluate_candidates(
     candidates: list[EvCandidate],
     required_ac_kwh: float,
     cfg: "Config",
     evaluate_fn: Callable[["EvRequest"], "OptimizerResult"],
     max_full_evaluations: int = 5,
+    extra_ranked_candidates: Optional[list[EvCandidate]] = None,
 ) -> tuple[Optional[EvCandidate], Optional["OptimizerResult"]]:
     """Vezme až `max_full_evaluations` nejlevnějších kandidátů (dle
-    `rank_candidates`) a pro každého zavolá `evaluate_fn` (typicky
+    `rank_candidates`), případně doplněných o další předseřazené kandidáty
+    (typicky PV-rich okna), a pro každého zavolá `evaluate_fn` (typicky
     `lib.optimizer.optimize` zabalené volajícím do jednoho argumentu
     `EvRequest -> OptimizerResult`) - vrátí kandidáta s NEJNIŽŠÍM
-    `economic_objective_czk` mezi těmi, které mají nulový
-    `ev_unserved_kwh` (plně proveditelné).
+    `economic_objective_czk` mezi těmi, které mají nulový `ev_unserved_kwh`
+    (plně proveditelné).
 
     Tento modul NEIMPORTUJE `lib.optimizer` přímo (viz docstring modulu)
     - `evaluate_fn` a `EvRequest` konstrukci zajišťuje volající."""
     from .optimizer import EvRequest  # pozdní import jen pro typovou konstrukci
 
-    ranked = rank_candidates(candidates)[:max_full_evaluations]
+    ranked = merge_candidate_rankings(
+        rank_candidates(candidates)[:max_full_evaluations],
+        extra_ranked_candidates or [],
+    )
     best_candidate = None
     best_result = None
     for c in ranked:
@@ -226,6 +279,8 @@ def recommend(
     price_import_czk_kwh: list[float],
     evaluate_fn: Callable[["EvRequest"], "OptimizerResult"],
     max_full_evaluations: int = 5,
+    pv_kwh: Optional[list[float]] = None,
+    max_pv_evaluations: int = 5,
 ) -> EvRecommendation:
     """Kompletní pipeline: enumerace -> levné skórování -> plné MILP
     ověření nejlepších kandidátů -> `EvRecommendation` (ARCH 8.1 výstupní
@@ -247,8 +302,17 @@ def recommend(
             "(deadline příliš blízko nebo required_ac_kwh příliš vysoké).",
         )
 
+    pv_ranked = []
+    if pv_kwh is not None:
+        pv_ranked = rank_candidates_by_pv(candidates, pv_kwh)[:max_pv_evaluations]
+
     best_candidate, best_result = evaluate_candidates(
-        candidates, required_ac_kwh, cfg, evaluate_fn, max_full_evaluations
+        candidates,
+        required_ac_kwh,
+        cfg,
+        evaluate_fn,
+        max_full_evaluations,
+        extra_ranked_candidates=pv_ranked,
     )
     if best_candidate is None:
         # Žádný z ověřených kandidátů nebyl plně proveditelný (fyzikální
