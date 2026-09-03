@@ -838,6 +838,11 @@ async def read_live_state() -> dict:
     for sensor in inverter.sensors():
         if sensor.id_ in data:
             out[sensor.id_] = data[sensor.id_]
+    return live_state_from_runtime_sensors(out)
+
+
+def live_state_from_runtime_sensors(out: dict) -> dict:
+    """Select the read-only GoodWe fields consumed by planner and executor."""
     return {
         "inverter_reachable": True,
         "battery_soc": out.get("battery_soc"),
@@ -847,6 +852,7 @@ async def read_live_state() -> dict:
         "load_p3": out.get("load_p3"),
         "ppv1": out.get("ppv1", 0),
         "ppv2": out.get("ppv2", 0),
+        "pbattery1": out.get("pbattery1"),
         "meter_active_power_total": out.get("meter_active_power_total"),
         "meter_active_power1": out.get("meter_active_power1"),
         "meter_active_power2": out.get("meter_active_power2"),

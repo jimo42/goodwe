@@ -20,12 +20,11 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
-- v3.0 (2026-08-16): Add a persisted, read-only-gated zero-export boiler
+- v3.0 (2026-08-23): Surface fail-closed probe prerequisites explicitly and
+  allow a confirmed probe to advance by one further phase in the next cycle.
+- v2.9 (2026-08-15): Add persisted, read-only-gated zero-export boiler
   probe-and-observe. It adds one phase at most, then accepts or rolls it back
-  only after a fresh minimum-on-compatible measurement window.
-- v2.9 (2026-08-10): Interpolate planned SoC within the current slot, include
-  actual SoC in deviation alerts, deduplicate changing residual values, and send
-  retry-safe boiler-full and EV-session-closed completion notifications.
+  only after a fresh five-minute measurement window.
 - v2.8 (2026-08-07): Persist direct-wallbox EV charging sessions, bind user or
   synthetic targets, and trigger idempotent detached replans at start/closure.
 - v2.7 (2026-08-06): Raise the SoC deviation alert threshold to 15 percentage
@@ -509,7 +508,7 @@ def read_export_limit_state() -> dict:
     """Read the external export-limit owner without ever modifying it."""
     try:
         return asyncio.run(inverter_client.read_export_limit_state())
-    except Exception as exc:  # An unreadable setting disables the probe fail-safe.
+    except Exception as exc:  # Probe is fail-safe off when the setting is unreadable.
         return {"status": "read_failed", "zero_export_active": False, "error": str(exc)}
 
 
@@ -567,9 +566,9 @@ def curtailment_probe_transition(
 ) -> Optional[dict]:
     """Return a bounded zero-export probe action, or ``None`` for normal control.
 
-    The external GoodWe setting must be read back as enabled with a 0 W limit.
-    Positive ``pbattery1`` is discharge (verified in the executor's existing
-    GoodWe sign convention); a discharge above tolerance rejects the probe.
+    The setting must be read back as *enabled with a 0 W limit*. A price-based
+    assumption alone is deliberately insufficient. Battery power follows the
+    GoodWe sign convention: positive is discharge, negative is charge.
     """
     if not cfg.boiler.curtailment_probe_enabled or hard_active:
         return None
@@ -587,7 +586,8 @@ def curtailment_probe_transition(
         observe_after = _parse_optional_datetime(state.get("observe_after"), ZoneInfo(cfg.system.timezone))
         if observe_after is None or now < observe_after:
             return {"kind": "hold", "target_mask": probed_mask, "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_OBSERVING"}
-        pv1_kw, pv2_kw = _live_kw(live_state, "ppv1"), _live_kw(live_state, "ppv2")
+        pv_kw = _live_kw(live_state, "ppv1")
+        pv2_kw = _live_kw(live_state, "ppv2")
         grid_kw = _live_kw(live_state, "meter_active_power_total")
         battery_kw = _live_kw(live_state, "pbattery1")
         baseline_pv = state.get("baseline_pv_kw")
@@ -597,7 +597,7 @@ def curtailment_probe_transition(
             isinstance(delivery, list) and len(added) == 1 and len(delivery) == 3
             and float(delivery[added[0]] or 0.0) >= 1.0
         )
-        pv_response = None if pv1_kw is None or pv2_kw is None or baseline_pv is None else pv1_kw + pv2_kw - float(baseline_pv)
+        pv_response = None if pv_kw is None or pv2_kw is None or baseline_pv is None else pv_kw + pv2_kw - float(baseline_pv)
         accepted = (
             _probe_fresh(telemetry_evidence, cfg)
             and grid_kw is not None and grid_kw >= -cfg.boiler.curtailment_probe_import_tolerance_kw
@@ -619,19 +619,29 @@ def curtailment_probe_transition(
     if cooldown_until is not None and now < cooldown_until:
         return {"kind": "cooldown", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_COOLDOWN"}
     if requested_phases > sum(current_mask):
+        return None  # Existing economic/hard logic already has a non-probe reason to grow.
+    if not export_limit_state.get("zero_export_active"):
         return None
-    if not export_limit_state.get("zero_export_active") or not _probe_fresh(telemetry_evidence, cfg):
-        return None
+    if not _probe_fresh(telemetry_evidence, cfg):
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_TELEMETRY_STALE"}
     grid_kw = _live_kw(live_state, "meter_active_power_total")
     battery_kw = _live_kw(live_state, "pbattery1")
     pv1_kw, pv2_kw = _live_kw(live_state, "ppv1"), _live_kw(live_state, "ppv2")
-    if (
-        grid_kw is None or battery_kw is None or pv1_kw is None or pv2_kw is None
-        or grid_kw < -cfg.boiler.curtailment_probe_import_tolerance_kw
-        or battery_kw > cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw
-        or pv1_kw + pv2_kw < cfg.boiler.curtailment_probe_min_pv_response_kw
-    ):
-        return None
+    unavailable = [
+        name for name, value in (("GRID_POWER", grid_kw), ("BATTERY_POWER", battery_kw), ("PV1_POWER", pv1_kw), ("PV2_POWER", pv2_kw))
+        if value is None
+    ]
+    if unavailable:
+        return {
+            "kind": "blocked", "reason": f"BOILER_EXPORT_CURTAILMENT_PROBE_{unavailable[0]}_UNAVAILABLE",
+            "evidence": {"unavailable": unavailable},
+        }
+    if grid_kw < -cfg.boiler.curtailment_probe_import_tolerance_kw:
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORTING", "evidence": {"grid_kw": grid_kw}}
+    if battery_kw > cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw:
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_BATTERY_DISCHARGING", "evidence": {"battery_kw": battery_kw}}
+    if pv1_kw + pv2_kw < cfg.boiler.curtailment_probe_min_pv_response_kw:
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_PV_TOO_LOW", "evidence": {"pv_kw": pv1_kw + pv2_kw}}
     target_mask, phase_evidence = _probe_one_additional_mask(
         current_mask=current_mask, live_state=live_state, ledger=ledger, now=now, cfg=cfg,
     )
@@ -650,7 +660,7 @@ def curtailment_probe_transition(
 def finalize_curtailment_probe(
     ledger: dict, *, transition: Optional[dict], decision: dict, confirmed_mask: tuple[bool, bool, bool], now: datetime, cfg: Config,
 ) -> dict:
-    """Persist probe state only after the relay read-back confirms its target."""
+    """Persist a probe state only after relay read-back confirms its target."""
     ledger = boiler_state.normalize_state(ledger)
     if not transition:
         return ledger
@@ -668,7 +678,12 @@ def finalize_curtailment_probe(
             "baseline_grid_kw": evidence.get("baseline_grid_kw"), "baseline_battery_kw": evidence.get("baseline_battery_kw"),
             "baseline_pv_kw": evidence.get("baseline_pv_kw"), "last_result": transition.get("reason"),
         })
-    elif kind in ("accept", "rollback") and written:
+    elif kind == "accept" and written:
+        probe.update({
+            "status": "idle", "cooldown_until": None, "last_result": transition.get("reason"),
+            "last_evidence": transition.get("evidence", {}),
+        })
+    elif kind == "rollback" and written:
         probe.update({
             "status": "idle", "cooldown_until": cooldown, "last_result": transition.get("reason"),
             "last_evidence": transition.get("evidence", {}),
@@ -967,31 +982,11 @@ def decide_boiler_execution(
     }
 
 
-def expected_soc_at(slot: dict, now: Optional[datetime], cfg: Config) -> Optional[float]:
-    """Linearly interpolate planned SoC inside the current 15-minute slot."""
-
-    start_soc = slot.get("soc_start_pct")
-    end_soc = slot.get("soc_end_pct")
-    if start_soc is None:
-        return None
-    if end_soc is None or now is None or not slot.get("slot_start"):
-        return float(start_soc)
-    try:
-        slot_start = parse_iso_datetime(str(slot["slot_start"]), ZoneInfo(cfg.system.timezone))
-    except (TypeError, ValueError):
-        return float(start_soc)
-    fraction = (now - slot_start).total_seconds() / (cfg.system.planning_step_minutes * 60.0)
-    fraction = min(1.0, max(0.0, fraction))
-    return float(start_soc) + (float(end_soc) - float(start_soc)) * fraction
-
-
-def detect_plan_deviation(
-    slot: Optional[dict], live_state: dict, cfg: Config, now: Optional[datetime] = None,
-) -> tuple[bool, str]:
+def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config) -> tuple[bool, str]:
     if not slot:
         return False, "NO_CURRENT_SLOT"
     actual_soc = live_state.get("battery_soc")
-    expected_soc = expected_soc_at(slot, now, cfg)
+    expected_soc = slot.get("soc_start_pct")
     if actual_soc is None or expected_soc is None:
         return False, "SOC_COMPARISON_UNAVAILABLE"
     signed_deviation = float(actual_soc) - float(expected_soc)
@@ -1003,7 +998,7 @@ def detect_plan_deviation(
     return False, f"SOC_DEVIATION_OK_{direction}_{deviation:.1f}_PCT_POINTS"
 
 
-def soc_deviation_alert_message(deviation_reason: str, actual_soc: Any = None) -> str:
+def soc_deviation_alert_message(deviation_reason: str) -> str:
     """Format the machine SoC reason as one concise Czech alert line."""
 
     parts = str(deviation_reason or "").split("_")
@@ -1012,75 +1007,8 @@ def soc_deviation_alert_message(deviation_reason: str, actual_soc: Any = None) -
         value = parts[3]
         direction_cs = {"ABOVE": "nad", "BELOW": "pod"}.get(direction)
         if direction_cs is not None:
-            current = ""
-            try:
-                current = f" (aktuálně {float(actual_soc):.0f}%)"
-            except (TypeError, ValueError):
-                pass
-            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem{current}"
+            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem"
     return f"FVE ALERT: významná odchylka: {deviation_reason}"
-
-
-def detect_boiler_full_completion(
-    ledger: dict, telemetry_evidence: dict, *, now: datetime,
-) -> dict:
-    """Detect the first robust thermostat stop of the local day."""
-
-    day = boiler_state.today_entry(ledger, now.date())
-    previous_kw = float(day.get("previous_confirmed_delivery_kw", 0.0) or 0.0)
-    confirmed_raw = telemetry_evidence.get("confirmed_boiler_delivery_kw")
-    sample_count = int(telemetry_evidence.get("sample_count", 0) or 0)
-    current_mask = ledger.get("current_mask", [])
-    try:
-        confirmed_kw = float(confirmed_raw)
-    except (TypeError, ValueError):
-        confirmed_kw = 0.0
-    detected_now = (
-        not day.get("full_detected_at")
-        and sample_count >= 3
-        and any(bool(value) for value in current_mask[:3])
-        and previous_kw >= 1.0
-        and confirmed_kw <= 0.25
-    )
-    if detected_now:
-        day["full_detected_at"] = now.isoformat()
-    day["previous_confirmed_delivery_kw"] = round(confirmed_kw, 6)
-    return {
-        "detected_now": detected_now,
-        "detected_at": day.get("full_detected_at"),
-        "notification_sent_at": day.get("full_notification_sent_at"),
-        "estimated_delivered_kwh": round(float(day.get("estimated_delivered_kwh", 0.0) or 0.0), 3),
-        "previous_confirmed_delivery_kw": round(previous_kw, 3),
-        "confirmed_delivery_kw": round(confirmed_kw, 3),
-        "sample_count": sample_count,
-    }
-
-
-def completion_notification_candidates(*, now: datetime, ledger: dict, session_state: dict) -> list[dict]:
-    """Build retry-safe one-shot completion notifications from persisted state."""
-
-    candidates: list[dict] = []
-    day = boiler_state.today_entry(ledger, now.date())
-    if day.get("full_detected_at") and not day.get("full_notification_sent_at"):
-        delivered = float(day.get("estimated_delivered_kwh", 0.0) or 0.0)
-        candidates.append({
-            "kind": "boiler_full",
-            "key": f"executor.boiler_full.{now.date().isoformat()}",
-            "message": f"Bojler je nahřátý naplno, dnes spotřeboval zhruba {delivered:.1f} kWh.",
-        })
-    if (
-        isinstance(session_state, dict)
-        and session_state.get("state") == "CLOSED"
-        and session_state.get("session_id")
-        and not session_state.get("completion_notification_sent_at")
-    ):
-        delivered = float(session_state.get("delivered_kwh", 0.0) or 0.0)
-        candidates.append({
-            "kind": "ev_closed",
-            "key": f"executor.ev_closed.{session_state['session_id']}",
-            "message": f"Auto je nabité, spotřeba {delivered:.1f} kWh.",
-        })
-    return candidates
 
 
 def detect_runtime_loads(
@@ -1227,10 +1155,6 @@ def send_executor_alerts(
     deviation_reason: str,
     battery_decision: Optional[dict] = None,
     device_failures: Optional[dict] = None,
-    actual_soc: Any = None,
-    boiler_ledger: Optional[dict] = None,
-    ev_charging_session: Optional[dict] = None,
-    ev_session_path: Optional[Path] = None,
     alert_state_path: Path = ALERT_STATE_PATH,
 ) -> list[dict]:
     """Send deduplicated executor-side alerts via notify_admins.sh."""
@@ -1303,32 +1227,11 @@ def send_executor_alerts(
     if deviation_detected and deviation_reason not in ("UNEXPECTED_LOAD_REPLAN",) and soc_deviation_alert_enabled:
         outcomes.append(alerting.notify_once(
             f"executor.plan_deviation.{deviation_reason.split('_')[0] if deviation_reason else 'unknown'}",
-            soc_deviation_alert_message(deviation_reason, actual_soc),
+            soc_deviation_alert_message(deviation_reason),
             cfg=cfg,
             state_path=alert_state_path,
             now=now,
-            deduplicate_message=False,
         ))
-
-    for candidate in completion_notification_candidates(
-        now=now,
-        ledger=boiler_ledger if isinstance(boiler_ledger, dict) else {},
-        session_state=ev_charging_session if isinstance(ev_charging_session, dict) else {},
-    ):
-        outcome = alerting.notify_once(
-            candidate["key"], candidate["message"], cfg=cfg,
-            state_path=alert_state_path, now=now, repeat_minutes=10 * 365 * 24 * 60,
-        )
-        outcomes.append(outcome)
-        if outcome.get("sent"):
-            if candidate["kind"] == "boiler_full":
-                boiler_state.today_entry(boiler_ledger, now.date())["full_notification_sent_at"] = now.isoformat()
-            elif candidate["kind"] == "ev_closed":
-                ev_charging_session["completion_notification_sent_at"] = now.isoformat()
-                if ev_session_path is not None:
-                    ev_session.mark_completion_notification_sent(
-                        ev_session_path, session_id=str(ev_charging_session["session_id"]), now=now,
-                    )
 
     return outcomes
 
@@ -1383,8 +1286,6 @@ def run_executor(
         samples, accounting_mask, cfg.boiler.phase_power_kw, now=now,
         persisted_phase_baseline_kw=ledger.get("phase_baseline_kw"),
     )
-    boiler_completion = detect_boiler_full_completion(ledger, telemetry_evidence, now=now)
-    ledger["boiler_full_completion"] = boiler_completion
     export_limit_state = read_export_limit_state() if forecast_valid else {
         "status": "not_read_invalid_forecast", "zero_export_active": False,
     }
@@ -1452,7 +1353,7 @@ def run_executor(
         detector_path=DETECTED_LOADS_PATH,
         wallbox_state=wallbox_state,
     )
-    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg, now=now)
+    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg)
     if detected_loads.get("unexpected_load", {}).get("replan_recommended"):
         deviation_detected = True
         deviation_reason = "UNEXPECTED_LOAD_REPLAN"
@@ -1490,12 +1391,7 @@ def run_executor(
         detected_loads=detected_loads,
         deviation_detected=deviation_detected,
         deviation_reason=deviation_reason,
-        actual_soc=live_state.get("battery_soc"),
-        boiler_ledger=ledger,
-        ev_charging_session=session_state,
-        ev_session_path=ev_session_path,
     )
-    atomic_write_json(boiler_state_path, ledger)
     atomic_write_json(DETECTED_LOADS_PATH, detected_loads)
     atomic_write_json(runtime_path, runtime)
     append_jsonl(history_path, runtime)
