@@ -138,3 +138,19 @@ def test_send_reports_sends_two_daily_messages_with_dedup():
         daily_report.HISTORY_PATH = original_history
         daily_report.FORECAST_PATH = original_forecast
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_completed_request_line_uses_reason_instead_of_fake_na_start():
+    lines = daily_report.request_lines([{
+        "type": "ev_charge",
+        "required_ac_kwh": 7.0,
+        "deadline": "2026-09-02T08:00:00+02:00",
+        "recommendation": {
+            "feasible": True,
+            "recommended_start": None,
+            "reason": "Požadovaný cíl již byl v uzavřené relaci dosažen.",
+        },
+    }])
+
+    assert lines[-1].endswith("Požadovaný cíl již byl v uzavřené relaci dosažen.")
+    assert "start=zatím bez startu" not in lines[-1]

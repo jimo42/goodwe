@@ -681,3 +681,51 @@ def test_build_store_request_caps_ev_at_nine_and_preserves_original():
     assert request["energy_limited_to_vehicle_max"] is True
     assert "9 kWh" in reply
     assert "12 kWh" in reply
+
+
+def test_replan_command_triggers_async_planner():
+    tmp = _tmpdir()
+    original = worker.trigger_planner_replan
+    calls = []
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=root / "planner.py",
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        _write_request(spool, "replan.json", "replan", "replan-1")
+
+        def fake_trigger(worker_paths, *, verbose=True):
+            calls.append((worker_paths, verbose))
+            return True
+
+        worker.trigger_planner_replan = fake_trigger
+        assert worker.process_one(paths, verbose=False) is True
+        assert len(calls) == 1
+        assert "spouštím mimořádný přepočet" in _reply_log(spool)
+    finally:
+        worker.trigger_planner_replan = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_describe_request_omits_no_window_prefix_for_completed_ev_reason():
+    text = worker.describe_request(
+        {"id": "ev-1", "type": "ev_charge", "required_ac_kwh": 7.0, "deadline": "2026-09-02T08:00:00+02:00"},
+        {"active_requests": [{
+            "id": "ev-1",
+            "type": "ev_charge",
+            "recommendation": {"feasible": True, "recommended_start": None, "reason": "Požadovaný cíl již byl v uzavřené relaci dosažen."},
+        }]},
+    )
+
+    assert "Zatím bez doporučeného okna:" not in text
+    assert text.endswith("Požadovaný cíl již byl v uzavřené relaci dosažen.")

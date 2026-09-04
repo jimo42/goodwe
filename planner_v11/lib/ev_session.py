@@ -3,6 +3,8 @@
 VERSION = "1.1"
 
 Changelog:
+- v1.2 (2026-09-04): Request a replan on every EV session close; executor may
+  skip starting it only when a regular planner run is already near.
 - v1.1 (2026-08-10): Add a session-identity guarded persistence helper for
   completion notification delivery metadata.
 - v1.0 (2026-08-07): Track wallbox-backed ACTIVE/PAUSED/CLOSED sessions,
@@ -21,7 +23,7 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
@@ -319,10 +321,9 @@ def update_session(
     target = max(0.0, _float(state.get("effective_target_kwh")))
     deviation = round(delivered - target, 3)
     state["final_deviation_kwh"] = deviation
-    if abs(deviation) >= REPLAN_DEVIATION_KWH:
-        state["replan_required"] = True
-        state["replan_reason"] = "EV_SESSION_CLOSED_DEVIATION"
-        state["replan_claimed_at"] = None
+    state["replan_required"] = True
+    state["replan_reason"] = "EV_SESSION_CLOSED_DEVIATION" if abs(deviation) >= REPLAN_DEVIATION_KWH else "EV_SESSION_CLOSED"
+    state["replan_claimed_at"] = None
     return state
 
 

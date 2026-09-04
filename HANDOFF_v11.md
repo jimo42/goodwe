@@ -1,3 +1,31 @@
+## Update 2026-09-04 — drobné provozní notifikace a WhatsApp replan
+
+- Připraveny/nasazeny změny:
+  - `show_status.py v1.3`: status ukazuje aktuální výkon FVE (`ppv1+ppv2`) a stav
+    přetoků jako `přetoky: povoleno/zakázáno` podle read-only `export_limit.zero_export_active`.
+  - `executor.py v3.1`: významná SoC odchylka má oddělené hranice `ABOVE >= +20 p.b.`
+    a `BELOW <= -10 p.b.`; alert dál zůstává vypnutý v DRY_RUN/shadow módu.
+  - `whatsapp_request_worker.py v1.8`: přijímá validovaný interní příkaz `replan`
+    a odpovídá potvrzením spuštění mimořádného přepočtu.
+  - `executor.py v3.1`: pokud plánované EV nabíjení nebo oznámená přídavná zátěž
+    nezačne do 15 minut, odešle deduplikované WhatsApp/admin upozornění. U EV se
+    bere pozdější z původního a aktuálně posunutého startu, takže malé posuny
+    typu 12:00 -> 12:15 posunou kontrolu na 12:30.
+  - `lib/ev_session.py v1.2` + `executor.py v3.1`: uzavření EV relace vyžádá replan;
+    executor jej nespustí jen tehdy, když je pravidelný hourly planner cron
+    (`*:07`) už v okně ±10 minut.
+  - `daily_report.py v1.3` a `whatsapp_request_worker.py v1.8`: u již splněných EV
+    požadavků se místo falešného `start=zatím bez startu` / prefixu
+    `Zatím bez doporučeného okna:` zobrazuje přímo důvod
+    `Požadovaný cíl již byl v uzavřené relaci dosažen.`
+- Produkční backup před deployem: `/home/automatization/goodwe/planner_v11/backups/misc_requested_changes_20260904_105005`.
+- Cílená validace na produkčním stromu: `git diff --check`, `py_compile` a
+  samostatný targeted runner pro `test_show_status.py`, `test_daily_report.py`,
+  `test_whatsapp_request_worker.py`, `test_executor.py`, `test_ev_session.py`:
+  **65/65 passed**.
+- Full `tests/run_manual.py` pořád není deploy gate kvůli dříve známým nesouvisejícím
+  selháním `test_boiler_redesign.py`.
+
 ## Curtailment probe v3.0 aktivován (2026-08-16 10:54 CEST)
 
 - Po výslovném schválení byl v ignorovaném produkčním `planner_v11/config.toml`

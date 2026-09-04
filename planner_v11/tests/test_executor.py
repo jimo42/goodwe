@@ -280,17 +280,17 @@ def test_soc_deviation_threshold_and_direction():
     assert cfg.alerts.soc_deviation_threshold_pct_points == 15.0
     slot = {"soc_start_pct": 50.0}
 
-    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 64.9}, cfg)
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 69.9}, cfg)
     assert detected is False
-    assert reason == "SOC_DEVIATION_OK_ABOVE_14.9_PCT_POINTS"
+    assert reason == "SOC_DEVIATION_OK_ABOVE_19.9_PCT_POINTS"
 
-    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 65.0}, cfg)
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 70.0}, cfg)
     assert detected is True
-    assert reason == "SOC_DEVIATION_ABOVE_15.0_PCT_POINTS"
+    assert reason == "SOC_DEVIATION_ABOVE_20.0_PCT_POINTS"
 
-    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 34.0}, cfg)
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 40.0}, cfg)
     assert detected is True
-    assert reason == "SOC_DEVIATION_BELOW_16.0_PCT_POINTS"
+    assert reason == "SOC_DEVIATION_BELOW_10.0_PCT_POINTS"
 
 
 def test_soc_deviation_interpolates_current_slot():
@@ -302,9 +302,17 @@ def test_soc_deviation_interpolates_current_slot():
         "soc_start_pct": 40.0,
         "soc_end_pct": 60.0,
     }
-    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 65.0}, cfg, now=now)
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 62.0}, cfg, now=now)
+    assert detected is False
+    assert reason == "SOC_DEVIATION_OK_ABOVE_12.0_PCT_POINTS"
+
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 28.0}, cfg, now=now)
     assert detected is True
-    assert reason == "SOC_DEVIATION_ABOVE_15.0_PCT_POINTS"
+    assert reason == "SOC_DEVIATION_BELOW_22.0_PCT_POINTS"
+
+    detected, reason = executor.detect_plan_deviation(slot, {"battery_soc": 48.0}, cfg, now=now)
+    assert detected is False
+    assert reason == "SOC_DEVIATION_OK_BELOW_2.0_PCT_POINTS"
 
 
 def test_soc_deviation_alert_message_is_concise_and_directional():
@@ -365,6 +373,67 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     assert executor.soc_deviation_alert_message("SOC_DEVIATION_BELOW_27.0_PCT_POINTS") == (
         "FVE ALERT: významná odchylka: SOC je o 27.0 % pod plánem"
     )
+
+
+def test_planned_load_watch_alerts_after_later_rescheduled_ev_start():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 4, 12, 30, tzinfo=tz)
+    slot = {
+        "slot_start": "2026-09-04T12:15:00+02:00",
+        "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+        "additional_load_kwh": 0.0,
+    }
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "announced_additional_load_kw": 0.0,
+        "planned_load_watch": {
+            "ev": {"state": "waiting", "planned_start": "2026-09-04T12:00:00+02:00"}
+        },
+    }
+
+    out = executor.update_planned_load_watch(detected, forecast_doc={"slots": [slot]}, current_slot=slot, now=now, cfg=cfg)
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["planned_start"] == "2026-09-04T12:15:00+02:00"
+    assert ev_watch["missing"] is True
+
+
+def test_send_executor_alerts_for_missing_planned_load():
+    cfg = _cfg()
+    now = datetime(2026, 9, 4, 12, 30, tzinfo=ZoneInfo(cfg.system.timezone))
+    calls = []
+    original = executor.alerting.notify.send
+    executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v11_missing_planned_load_")
+    try:
+        outcomes = executor.send_executor_alerts(
+            now=now,
+            cfg=cfg,
+            forecast_valid=True,
+            forecast_reasons=[],
+            boiler_decision={},
+            relay_health={"relay_status_ok": True},
+            detected_loads={"planned_load_watch": {"additional_load": {
+                "missing": True,
+                "alert_key": "executor.planned_load_missing.additional_load.test",
+                "message": "Chtěli jste přídavnou zátěž, ale po 15 minutách není detekována.",
+            }}},
+            deviation_detected=False,
+            deviation_reason="SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS",
+            alert_state_path=Path(tmp) / "alerts.json",
+        )
+    finally:
+        executor.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert len(outcomes) == 1
+    assert calls == ["Chtěli jste přídavnou zátěž, ale po 15 minutách není detekována."]
+
+
+def test_ev_close_replan_gate_skips_near_hourly_regular_planner():
+    tz = ZoneInfo("Europe/Prague")
+    assert executor.ev_close_replan_allowed(datetime(2026, 9, 4, 12, 16, tzinfo=tz)) is False
+    assert executor.ev_close_replan_allowed(datetime(2026, 9, 4, 12, 30, tzinfo=tz)) is True
 
 
 def test_send_executor_alerts_for_relay_health_failure():

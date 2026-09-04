@@ -2,9 +2,11 @@
 """
 Daily report notifications for planner_v10.
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 Changelog:
+- v1.3 (2026-09-04): In active EV requests, show completed closed-session
+  reasons instead of a fake "zatím bez startu" line.
 - v1.2 (2026-07-25): Treat GoodWe runtime power fields as watts, add forecast
   fixed-load and hard/opportunistic boiler split to the next-24h outlook.
 - v1.1 (2026-07-24): Split output into two admin notifications: last 24 hours
@@ -211,6 +213,15 @@ def fmt_seconds(value: Any) -> str:
         return "n/a"
 
 
+def _request_completion_reason(req: dict[str, Any], rec: dict[str, Any]) -> str | None:
+    reason = rec.get("reason")
+    if reason:
+        return str(reason)
+    completion = req.get("completion") if isinstance(req.get("completion"), dict) else {}
+    reason = completion.get("reason") if isinstance(completion, dict) else None
+    return str(reason) if reason else None
+
+
 def request_lines(active_requests: list) -> list[str]:
     if not isinstance(active_requests, list) or not active_requests:
         return ["aktivní požadavky: žádné"]
@@ -221,10 +232,13 @@ def request_lines(active_requests: list) -> list[str]:
         rtype = req.get("type", "unknown")
         rec = req.get("recommendation", {}) if isinstance(req.get("recommendation"), dict) else {}
         if rtype == "ev_charge":
-            lines.append(
-                f"- auto {req.get('required_ac_kwh', 'n/a')} kWh do {req.get('deadline', 'n/a')}: "
-                f"feasible={rec.get('feasible')}, start={rec.get('recommended_start') or 'zatím bez startu'}"
-            )
+            start = rec.get("recommended_start")
+            if start:
+                tail = f"feasible={rec.get('feasible')}, start={start}"
+            else:
+                reason = _request_completion_reason(req, rec)
+                tail = f"{reason}" if reason else f"feasible={rec.get('feasible')}, start=zatím bez startu"
+            lines.append(f"- auto {req.get('required_ac_kwh', 'n/a')} kWh do {req.get('deadline', 'n/a')}: {tail}")
         elif rtype == "boiler_full":
             lines.append(f"- bojler do {req.get('deadline', 'n/a')}")
         elif rtype == "additional_load":

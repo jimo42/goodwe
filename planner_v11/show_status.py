@@ -2,9 +2,10 @@
 """
 Human-readable planner_v11 status report.
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 Changelog:
+- v1.3 (2026-09-04): Show current PV production and export permission status.
 - v1.2 (2026-08-02): Add planner daily budget, executor economics, minute
   telemetry, phase-mask/headroom and commanded-vs-delivered ledger details.
 - v1.1 (2026-07-27): Show the instantaneous signed smart-meter grid flow
@@ -24,7 +25,7 @@ from zoneinfo import ZoneInfo
 from lib.config import load_config
 
 
-VERSION = "1.2"
+VERSION = "1.3"
 PLANNER_DIR = Path(__file__).resolve().parent
 STATE_DIR = PLANNER_DIR / "state"
 DEFAULT_CONFIG_PATH = PLANNER_DIR / "config.toml"
@@ -83,6 +84,30 @@ def fmt_grid_flow(power_w: Any) -> str:
     return "0 W (bez toku)"
 
 
+def fmt_pv_power(live_state: dict[str, Any]) -> str:
+    total = 0.0
+    seen = False
+    for key in ("ppv1", "ppv2"):
+        try:
+            total += float(live_state[key])
+            seen = True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return fmt(total, " W", 0) if seen else "n/a"
+
+
+def fmt_export_permission(export_limit: dict[str, Any]) -> str:
+    if not isinstance(export_limit, dict):
+        return "n/a"
+    if export_limit.get("zero_export_active") is True:
+        return "zakázáno"
+    if export_limit.get("zero_export_active") is False:
+        status = export_limit.get("status")
+        suffix = f" ({status})" if status in ("read_failed", "not_read_invalid_forecast") else ""
+        return f"povoleno{suffix}"
+    return "n/a"
+
+
 def action_changes(slots: list[dict], now: datetime, hours: float, tz: ZoneInfo) -> list[dict]:
     end = now + timedelta(hours=hours)
     out: list[dict] = []
@@ -109,6 +134,7 @@ def build_status(*, hours: float, full: bool) -> str:
     slots = forecast.get("slots", []) if isinstance(forecast, dict) else []
     current = find_current_slot(slots, now, cfg.system.planning_step_minutes, tz) if isinstance(slots, list) else None
     live = runtime.get("live_state", {}) if isinstance(runtime, dict) else {}
+    export_limit = runtime.get("export_limit", {}) if isinstance(runtime, dict) else {}
     boiler_decision = runtime.get("boiler_decision", {}) if isinstance(runtime, dict) else {}
     telemetry = runtime.get("boiler_telemetry", {}) if isinstance(runtime, dict) else {}
     current_day = ledger.get("days", {}).get(now.date().isoformat(), {}) if isinstance(ledger, dict) else {}
@@ -129,6 +155,8 @@ def build_status(*, hours: float, full: bool) -> str:
         "",
         "== Teď ==",
         f"SoC live:      {fmt(live.get('battery_soc'), '%')}",
+        f"FVE live:      {fmt_pv_power(live)}",
+        f"přetoky:       {fmt_export_permission(export_limit)}",
         f"dům live:      {fmt(live.get('house_consumption'), ' W', 0)}",
         f"síť live:      {fmt_grid_flow(live.get('meter_active_power_total'))}",
         "síť fáze:      " + " | ".join(

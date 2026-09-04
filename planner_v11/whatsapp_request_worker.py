@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 Changelog:
+- v1.8 (2026-09-04): Accept validated `replan` WhatsApp commands and omit the
+  "Zatím bez doporučeného okna" prefix for completed EV requests.
 - v1.7 (2026-08-14): Accept only optimal correlated replans and stop retrying
   deterministic solver timeout exits within one WhatsApp request.
 - v1.6 (2026-08-07): Cap one EV request at 9 kWh while retaining the original
@@ -48,7 +50,7 @@ from lib import request_store
 MAX_EV_SESSION_KWH = 9.0
 
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 PLANNER_REPLAN_MAX_ATTEMPTS = 2
 PLANNER_REPLAN_RETRY_SECONDS = 5.0
@@ -421,7 +423,7 @@ def describe_request(item: dict[str, Any], forecast: Any = None) -> str:
             if start and end:
                 text += f". Nabíjení naplánovat na {format_user_interval(start, end)}"
             elif recommendation.get("reason"):
-                text += f". Zatím bez doporučeného okna: {recommendation['reason']}"
+                text += f". {recommendation['reason']}"
         return text
     if rtype == "boiler_full":
         return f"bojler do {format_user_datetime(item.get('deadline'))}"
@@ -808,7 +810,7 @@ def build_store_request(command: str, request_id: str, created_at: str) -> tuple
     raise RequestError(
         "Nerozumím internímu příkazu. Podporuji: status, "
         "charge car;<kWh>kWh;<deadline>, heat boiler;<deadline>, "
-        "additional load;<kW>kW;<start>;<end>, requests, cancel <číslo>."
+        "additional load;<kW>kW;<start>;<end>, requests, replan, cancel <číslo>."
     )
 
 
@@ -836,6 +838,11 @@ def process_claimed(path: Path, paths: WorkerPaths, *, verbose: bool = True) -> 
         return ProcessOutcome(True, run_status(paths))
     if command == "requests":
         return ProcessOutcome(True, build_requests_reply(paths))
+    if command == "replan":
+        started = trigger_planner_replan(paths, verbose=verbose)
+        if started:
+            return ProcessOutcome(True, "ok, spouštím mimořádný přepočet plánu.")
+        return ProcessOutcome(True, "Přepočet se teď nepodařilo spustit. Detail je v logu.")
 
     match = CANCEL_RE.match(command)
     if match:

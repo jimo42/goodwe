@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v3.1 (2026-09-04): Split significant SoC deviation thresholds (+20/-10),
+  alert when planned EV/additional loads are not detected within 15 minutes,
+  and replan on EV charge end unless a regular planner run is within ±10 min.
 - v3.0 (2026-08-23): Surface fail-closed probe prerequisites explicitly and
   allow a confirmed probe to advance by one further phase in the next cycle.
 - v2.9 (2026-08-15): Add persisted, read-only-gated zero-export boiler
@@ -69,7 +72,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "3.0"
+VERSION = "3.1"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -88,6 +91,12 @@ REQUESTS_PATH = STATE_DIR / "requests.json"
 PLANNER_REPLAN_LOG_PATH = PLANNER_DIR.parent / "logs" / "planner_v11.log"
 
 PHASE_ORDER = ("L1", "L2", "L3")
+SOC_DEVIATION_ABOVE_THRESHOLD_PCT_POINTS = 20.0
+SOC_DEVIATION_BELOW_THRESHOLD_PCT_POINTS = 10.0
+PLANNED_LOAD_MISSING_GRACE_MINUTES = 15.0
+EV_CLOSE_REPLAN_REGULAR_CRON_INTERVAL_MINUTES = 60.0
+EV_CLOSE_REPLAN_REGULAR_CRON_ANCHOR_MINUTE = 7.0
+EV_CLOSE_REPLAN_REGULAR_CRON_TOLERANCE_MINUTES = 10.0
 PHASE_CURRENT_KEYS = {
     "L1": ("igrid1", "meter_active_power1"),
     "L2": ("igrid2", "meter_active_power2"),
@@ -982,23 +991,41 @@ def decide_boiler_execution(
     }
 
 
-def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config) -> tuple[bool, str]:
+def _interpolated_expected_soc_pct(slot: dict, now: datetime, cfg: Config) -> float:
+    start_soc = float(slot.get("soc_start_pct"))
+    end_soc = float(slot.get("soc_end_pct", start_soc))
+    try:
+        start = parse_iso_datetime(str(slot.get("slot_start", "")), ZoneInfo(cfg.system.timezone))
+    except (TypeError, ValueError):
+        return start_soc
+    local_now = now.astimezone(start.tzinfo) if now.tzinfo and start.tzinfo else now
+    elapsed = max(0.0, min(cfg.system.planning_step_minutes * 60.0, (local_now - start).total_seconds()))
+    fraction = elapsed / (cfg.system.planning_step_minutes * 60.0)
+    return start_soc + (end_soc - start_soc) * fraction
+
+
+def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config, *, now: Optional[datetime] = None) -> tuple[bool, str]:
     if not slot:
         return False, "NO_CURRENT_SLOT"
     actual_soc = live_state.get("battery_soc")
     expected_soc = slot.get("soc_start_pct")
     if actual_soc is None or expected_soc is None:
         return False, "SOC_COMPARISON_UNAVAILABLE"
-    signed_deviation = float(actual_soc) - float(expected_soc)
+    if now is not None:
+        expected = _interpolated_expected_soc_pct(slot, now, cfg)
+    else:
+        expected = float(expected_soc)
+    signed_deviation = float(actual_soc) - expected
     deviation = abs(signed_deviation)
     direction = "ABOVE" if signed_deviation >= 0.0 else "BELOW"
     # Konfigurovaný diagnostický práh slouží jen pro alert/report, ne jako action.
-    if deviation >= cfg.alerts.soc_deviation_threshold_pct_points:
+    threshold = SOC_DEVIATION_ABOVE_THRESHOLD_PCT_POINTS if signed_deviation >= 0.0 else SOC_DEVIATION_BELOW_THRESHOLD_PCT_POINTS
+    if deviation >= threshold:
         return True, f"SOC_DEVIATION_{direction}_{deviation:.1f}_PCT_POINTS"
     return False, f"SOC_DEVIATION_OK_{direction}_{deviation:.1f}_PCT_POINTS"
 
 
-def soc_deviation_alert_message(deviation_reason: str) -> str:
+def soc_deviation_alert_message(deviation_reason: str, actual_soc: Optional[float] = None) -> str:
     """Format the machine SoC reason as one concise Czech alert line."""
 
     parts = str(deviation_reason or "").split("_")
@@ -1007,7 +1034,8 @@ def soc_deviation_alert_message(deviation_reason: str) -> str:
         value = parts[3]
         direction_cs = {"ABOVE": "nad", "BELOW": "pod"}.get(direction)
         if direction_cs is not None:
-            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem"
+            suffix = "" if actual_soc is None else f" (aktuálně {actual_soc:g}%)"
+            return f"FVE ALERT: významná odchylka: SOC je o {value} % {direction_cs} plánem{suffix}"
     return f"FVE ALERT: významná odchylka: {deviation_reason}"
 
 
@@ -1036,6 +1064,191 @@ def detect_runtime_loads(
         boiler_ledger=boiler_ledger if isinstance(boiler_ledger, dict) else {},
         telemetry_evidence=telemetry_evidence if isinstance(telemetry_evidence, dict) else {},
     )
+
+
+def _planned_power_kw(slot: Optional[dict], key: str, cfg: Config) -> float:
+    if not isinstance(slot, dict):
+        return 0.0
+    try:
+        value = float(slot.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if key.endswith("_kwh"):
+        return value / (cfg.system.planning_step_minutes / 60.0)
+    return value
+
+
+def _dt_iso(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def _parse_watch_datetime(raw: Any, now: datetime) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None and now.tzinfo is not None:
+        dt = dt.replace(tzinfo=now.tzinfo)
+    elif dt.tzinfo is not None and now.tzinfo is not None:
+        dt = dt.astimezone(now.tzinfo)
+    return dt
+
+
+def _forecast_planned_start(
+    forecast_doc: Optional[dict],
+    *,
+    now: datetime,
+    kind: str,
+    cfg: Config,
+) -> Optional[datetime]:
+    slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
+    if not isinstance(slots, list):
+        return None
+    key = "ev_load_kwh" if kind == "ev" else "additional_load_kwh"
+    tz = ZoneInfo(cfg.system.timezone)
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        try:
+            slot_start = parse_iso_datetime(str(slot.get("slot_start", "")), tz)
+        except (TypeError, ValueError):
+            continue
+        if slot_start < now:
+            continue
+        if _planned_power_kw(slot, key, cfg) > 0.05:
+            return slot_start.astimezone(now.tzinfo) if now.tzinfo else slot_start
+    return None
+
+
+def _forecast_active_window_start(
+    forecast_doc: Optional[dict],
+    *,
+    now: datetime,
+    kind: str,
+    cfg: Config,
+) -> Optional[datetime]:
+    slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
+    if not isinstance(slots, list):
+        return None
+    key = "ev_load_kwh" if kind == "ev" else "additional_load_kwh"
+    tz = ZoneInfo(cfg.system.timezone)
+    step = timedelta(minutes=cfg.system.planning_step_minutes)
+    parsed: list[tuple[datetime, bool]] = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        try:
+            slot_start = parse_iso_datetime(str(slot.get("slot_start", "")), tz)
+        except (TypeError, ValueError):
+            continue
+        parsed.append((slot_start.astimezone(now.tzinfo) if now.tzinfo else slot_start, _planned_power_kw(slot, key, cfg) > 0.05))
+    parsed.sort(key=lambda item: item[0])
+    active_start: Optional[datetime] = None
+    previous_start: Optional[datetime] = None
+    for slot_start, active in parsed:
+        if active and (active_start is None or previous_start is None or slot_start - previous_start > step):
+            active_start = slot_start
+        if active and slot_start <= now < slot_start + step:
+            return active_start or slot_start
+        if not active:
+            active_start = None
+        previous_start = slot_start
+    return None
+
+
+def update_planned_load_watch(
+    detected_loads: dict,
+    *,
+    forecast_doc: Optional[dict],
+    current_slot: Optional[dict],
+    now: datetime,
+    cfg: Config,
+) -> dict:
+    """Track planned EV/additional loads that fail to appear within 15 minutes."""
+
+    if not isinstance(detected_loads, dict):
+        return detected_loads
+    previous_watch = detected_loads.get("planned_load_watch", {})
+    previous_watch = previous_watch if isinstance(previous_watch, dict) else {}
+    watch: dict[str, dict[str, Any]] = {}
+    specs = (
+        {
+            "kind": "ev",
+            "planned_key": "ev_load_kwh",
+            "detected_kw": float(detected_loads.get("ev", {}).get("detected_kw", 0.0) or 0.0),
+            "threshold_kw": 0.2,
+            "message": "Chtěli jste naplánované nabíjení auta, ale po 15 minutách není detekováno.",
+        },
+        {
+            "kind": "additional_load",
+            "planned_key": "additional_load_kwh",
+            "detected_kw": float(detected_loads.get("measured_house_kw", 0.0) or 0.0),
+            "threshold_kw": 0.2,
+            "message": "Chtěli jste přídavnou zátěž, ale po 15 minutách není detekována.",
+        },
+    )
+    for spec in specs:
+        kind = spec["kind"]
+        planned_kw = _planned_power_kw(current_slot, spec["planned_key"], cfg)
+        prior = previous_watch.get(kind) if isinstance(previous_watch.get(kind), dict) else {}
+        planned_start = None
+        if planned_kw > 0.05:
+            current_start = _forecast_active_window_start(forecast_doc, now=now, kind=kind, cfg=cfg)
+            if current_start is None:
+                current_start = _parse_watch_datetime((current_slot or {}).get("slot_start"), now)
+            prior_start = _parse_watch_datetime(prior.get("planned_start"), now)
+            candidates = [value for value in (current_start, prior_start) if value is not None]
+            planned_start = max(candidates) if candidates else now
+        elif prior.get("state") == "waiting":
+            prior_start = _parse_watch_datetime(prior.get("planned_start"), now)
+            next_start = _forecast_planned_start(forecast_doc, now=now, kind=kind, cfg=cfg)
+            candidates = [value for value in (prior_start, next_start) if value is not None]
+            planned_start = max(candidates) if candidates else None
+        else:
+            next_start = _forecast_planned_start(forecast_doc, now=now, kind=kind, cfg=cfg)
+            if next_start is not None and next_start <= now:
+                planned_start = next_start
+
+        if planned_start is None:
+            watch[kind] = {"state": "idle", "planned_start": None, "alert_due_at": None, "alert_key": None}
+            continue
+        due_at = planned_start + timedelta(minutes=PLANNED_LOAD_MISSING_GRACE_MINUTES)
+        if kind == "additional_load":
+            detected = float(spec["detected_kw"]) >= max(float(spec["threshold_kw"]), planned_kw * 0.5)
+        else:
+            detected = float(spec["detected_kw"]) >= float(spec["threshold_kw"])
+        state = "detected" if detected else "waiting"
+        alert_key = f"executor.planned_load_missing.{kind}.{planned_start.isoformat()}"
+        watch[kind] = {
+            "state": state,
+            "planned_start": _dt_iso(planned_start),
+            "alert_due_at": _dt_iso(due_at),
+            "detected_kw": round(float(spec["detected_kw"]), 3),
+            "planned_kw": round(planned_kw, 3),
+            "missing": (not detected) and now >= due_at,
+            "alert_key": alert_key,
+            "message": spec["message"],
+        }
+    detected_loads["planned_load_watch"] = watch
+    return detected_loads
+
+
+def ev_close_replan_allowed(
+    now: datetime,
+    *,
+    interval_minutes: float = EV_CLOSE_REPLAN_REGULAR_CRON_INTERVAL_MINUTES,
+    anchor_minute: float = EV_CLOSE_REPLAN_REGULAR_CRON_ANCHOR_MINUTE,
+) -> bool:
+    """Return False if a regular periodic planner run is already within ±10 minutes."""
+
+    if interval_minutes <= 0:
+        return True
+    minute = now.minute + now.second / 60.0 + now.microsecond / 60_000_000.0
+    offset = (minute - anchor_minute) % interval_minutes
+    nearest = min(offset, interval_minutes - offset)
+    return nearest > EV_CLOSE_REPLAN_REGULAR_CRON_TOLERANCE_MINUTES
 
 
 def read_wallbox_state_for_detection() -> dict:
@@ -1155,6 +1368,9 @@ def send_executor_alerts(
     deviation_reason: str,
     battery_decision: Optional[dict] = None,
     device_failures: Optional[dict] = None,
+    actual_soc: Optional[float] = None,
+    boiler_ledger: Optional[dict] = None,
+    ev_charging_session: Optional[dict] = None,
     alert_state_path: Path = ALERT_STATE_PATH,
 ) -> list[dict]:
     """Send deduplicated executor-side alerts via notify_admins.sh."""
@@ -1182,6 +1398,21 @@ def send_executor_alerts(
             state_path=alert_state_path,
             now=now,
         ))
+
+    watch = detected_loads.get("planned_load_watch", {}) if isinstance(detected_loads, dict) else {}
+    if isinstance(watch, dict):
+        for kind, item in sorted(watch.items()):
+            if not isinstance(item, dict) or not item.get("missing"):
+                continue
+            key = str(item.get("alert_key") or f"executor.planned_load_missing.{kind}")
+            outcomes.append(alerting.notify_once(
+                key,
+                str(item.get("message") or "Chtěli jste naplánovanou spotřebu, ale po 15 minutách není detekována."),
+                cfg=cfg,
+                state_path=alert_state_path,
+                now=now,
+                repeat_minutes=24 * 60,
+            ))
 
     device_failures = device_failures or {}
     relay_failures = int(device_failures.get("relay", {}).get("consecutive_failures", 0) or 0)
@@ -1227,11 +1458,42 @@ def send_executor_alerts(
     if deviation_detected and deviation_reason not in ("UNEXPECTED_LOAD_REPLAN",) and soc_deviation_alert_enabled:
         outcomes.append(alerting.notify_once(
             f"executor.plan_deviation.{deviation_reason.split('_')[0] if deviation_reason else 'unknown'}",
-            soc_deviation_alert_message(deviation_reason),
+            soc_deviation_alert_message(deviation_reason, actual_soc),
             cfg=cfg,
             state_path=alert_state_path,
             now=now,
+            deduplicate_message=False,
         ))
+
+    if isinstance(boiler_ledger, dict):
+        day = boiler_state.today_entry(boiler_ledger, now.date())
+        if day.get("full_detected_at") and not day.get("full_notification_sent_at"):
+            delivered = float(day.get("estimated_delivered_kwh", 0.0) or 0.0)
+            outcomes.append(alerting.notify_once(
+                f"executor.boiler_full.{now.date().isoformat()}",
+                f"Bojler je nahřátý naplno, dnes spotřeboval zhruba {delivered:.1f} kWh.",
+                cfg=cfg,
+                state_path=alert_state_path,
+                now=now,
+                repeat_minutes=24 * 60,
+            ))
+            if outcomes[-1].get("sent"):
+                day["full_notification_sent_at"] = now.isoformat()
+
+    if isinstance(ev_charging_session, dict):
+        session_id = ev_charging_session.get("session_id")
+        if ev_charging_session.get("state") == "CLOSED" and session_id and not ev_charging_session.get("completion_notification_sent_at"):
+            delivered = float(ev_charging_session.get("delivered_kwh", 0.0) or 0.0)
+            outcomes.append(alerting.notify_once(
+                f"executor.ev_session_completed.{session_id}",
+                f"Auto je nabité, spotřeba {delivered:.1f} kWh.",
+                cfg=cfg,
+                state_path=alert_state_path,
+                now=now,
+                repeat_minutes=24 * 60,
+            ))
+            if outcomes[-1].get("sent"):
+                ev_charging_session["completion_notification_sent_at"] = now.isoformat()
 
     return outcomes
 
@@ -1341,7 +1603,19 @@ def run_executor(
         wallbox=wallbox_state,
         active_ev_request=active_ev_request(now, requests_path),
     )
-    session_replan = trigger_ev_session_replan(now=now, session_path=ev_session_path)
+    session_replan = {"claimed": False, "started": False, "reason": session_state.get("replan_reason")}
+    replan_reason = str(session_state.get("replan_reason") or "")
+    if session_state.get("replan_required") and replan_reason.startswith("EV_SESSION_CLOSED") and not ev_close_replan_allowed(now):
+        claimed, claimed_state = ev_session.claim_replan(ev_session_path, now=now)
+        session_replan.update({
+            "claimed": claimed,
+            "started": False,
+            "reason": claimed_state.get("last_replan_reason") or claimed_state.get("replan_reason"),
+            "skipped_near_regular_replan": True,
+        })
+        session_state = claimed_state
+    else:
+        session_replan = trigger_ev_session_replan(now=now, session_path=ev_session_path)
     detected_loads = detect_runtime_loads(
         now=now,
         cfg=cfg,
@@ -1353,7 +1627,14 @@ def run_executor(
         detector_path=DETECTED_LOADS_PATH,
         wallbox_state=wallbox_state,
     )
-    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg)
+    detected_loads = update_planned_load_watch(
+        detected_loads,
+        forecast_doc=forecast_doc,
+        current_slot=current_slot,
+        now=now,
+        cfg=cfg,
+    )
+    deviation_detected, deviation_reason = detect_plan_deviation(current_slot, live_state, cfg, now=now)
     if detected_loads.get("unexpected_load", {}).get("replan_recommended"):
         deviation_detected = True
         deviation_reason = "UNEXPECTED_LOAD_REPLAN"
@@ -1379,7 +1660,7 @@ def run_executor(
     runtime["export_limit"] = export_limit_state
     runtime["ev_session_replan"] = session_replan
     runtime["device_failures"] = {"relay": relay_failure, "battery_eco": battery_failure}
-    runtime["alerts"] = send_executor_alerts(
+    alerts = send_executor_alerts(
         now=now,
         cfg=cfg,
         forecast_valid=forecast_valid,
@@ -1391,7 +1672,22 @@ def run_executor(
         detected_loads=detected_loads,
         deviation_detected=deviation_detected,
         deviation_reason=deviation_reason,
+        actual_soc=live_state.get("battery_soc"),
+        boiler_ledger=ledger,
+        ev_charging_session=session_state,
     )
+    if isinstance(ledger, dict):
+        today = boiler_state.today_entry(ledger, now.date())
+        if today.get("full_notification_sent_at"):
+            atomic_write_json(boiler_state_path, ledger)
+    if session_state.get("completion_notification_sent_at") and session_state.get("session_id"):
+        session_state = ev_session.mark_completion_notification_sent(
+            ev_session_path,
+            session_id=str(session_state["session_id"]),
+            now=now,
+        )
+        runtime["ev_charging_session"] = session_state
+    runtime["alerts"] = alerts
     atomic_write_json(DETECTED_LOADS_PATH, detected_loads)
     atomic_write_json(runtime_path, runtime)
     append_jsonl(history_path, runtime)
