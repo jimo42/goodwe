@@ -1113,6 +1113,40 @@ def _planned_power_kw(slot: Optional[dict], key: str, cfg: Config) -> float:
     return value
 
 
+def _planned_watch_power_kw(slot: Optional[dict], kind: str, cfg: Config) -> float:
+    """Return user-requested power that should be monitored as missing.
+
+    The planner stores multiple sources in `additional_load_kwh`: explicit user
+    announced loads, temporary detector adjustments and unannounced-EV
+    projections. The WhatsApp "Chtěli jste přídavnou zátěž..." alert must only
+    track the explicit user-announced part, otherwise pool heat-pump detector
+    projections look like user requests and can produce false alerts.
+    """
+
+    if kind == "ev":
+        return _planned_power_kw(slot, "ev_load_kwh", cfg)
+    if kind != "additional_load" or not isinstance(slot, dict):
+        return 0.0
+
+    breakdown = slot.get("additional_load_breakdown")
+    if isinstance(breakdown, dict):
+        try:
+            if "announced_kw" in breakdown:
+                return max(0.0, float(breakdown.get("announced_kw", 0.0) or 0.0))
+            if "announced_kwh" in breakdown:
+                return max(0.0, float(breakdown.get("announced_kwh", 0.0) or 0.0)) / (
+                    cfg.system.planning_step_minutes / 60.0
+                )
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.0
+
+    # Legacy forecasts did not expose the split. Keep them compatible, but all
+    # current planner outputs include `additional_load_breakdown`, so detector
+    # projections are ignored in normal production operation.
+    return _planned_power_kw(slot, "additional_load_kwh", cfg)
+
+
 def _dt_iso(value: datetime) -> str:
     return value.isoformat(timespec="seconds")
 
@@ -1141,7 +1175,6 @@ def _forecast_planned_start(
     slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
     if not isinstance(slots, list):
         return None
-    key = "ev_load_kwh" if kind == "ev" else "additional_load_kwh"
     tz = ZoneInfo(cfg.system.timezone)
     for slot in slots:
         if not isinstance(slot, dict):
@@ -1152,9 +1185,33 @@ def _forecast_planned_start(
             continue
         if slot_start < now:
             continue
-        if _planned_power_kw(slot, key, cfg) > 0.05:
+        if _planned_watch_power_kw(slot, kind, cfg) > 0.05:
             return slot_start.astimezone(now.tzinfo) if now.tzinfo else slot_start
     return None
+
+
+def _forecast_has_planned_start(
+    forecast_doc: Optional[dict],
+    *,
+    planned_start: datetime,
+    kind: str,
+    cfg: Config,
+) -> bool:
+    slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
+    if not isinstance(slots, list):
+        return False
+    tz = ZoneInfo(cfg.system.timezone)
+    target = planned_start.astimezone(tz) if planned_start.tzinfo is not None else planned_start.replace(tzinfo=tz)
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        try:
+            slot_start = parse_iso_datetime(str(slot.get("slot_start", "")), tz)
+        except (TypeError, ValueError):
+            continue
+        if slot_start == target and _planned_watch_power_kw(slot, kind, cfg) > 0.05:
+            return True
+    return False
 
 
 def _forecast_active_window_start(
@@ -1167,7 +1224,6 @@ def _forecast_active_window_start(
     slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
     if not isinstance(slots, list):
         return None
-    key = "ev_load_kwh" if kind == "ev" else "additional_load_kwh"
     tz = ZoneInfo(cfg.system.timezone)
     step = timedelta(minutes=cfg.system.planning_step_minutes)
     parsed: list[tuple[datetime, bool]] = []
@@ -1178,7 +1234,7 @@ def _forecast_active_window_start(
             slot_start = parse_iso_datetime(str(slot.get("slot_start", "")), tz)
         except (TypeError, ValueError):
             continue
-        parsed.append((slot_start.astimezone(now.tzinfo) if now.tzinfo else slot_start, _planned_power_kw(slot, key, cfg) > 0.05))
+        parsed.append((slot_start.astimezone(now.tzinfo) if now.tzinfo else slot_start, _planned_watch_power_kw(slot, kind, cfg) > 0.05))
     parsed.sort(key=lambda item: item[0])
     active_start: Optional[datetime] = None
     previous_start: Optional[datetime] = None
@@ -1211,14 +1267,12 @@ def update_planned_load_watch(
     specs = (
         {
             "kind": "ev",
-            "planned_key": "ev_load_kwh",
             "detected_kw": float(detected_loads.get("ev", {}).get("detected_kw", 0.0) or 0.0),
             "threshold_kw": 0.2,
             "message": "Chtěli jste naplánované nabíjení auta, ale po 15 minutách není detekováno.",
         },
         {
             "kind": "additional_load",
-            "planned_key": "additional_load_kwh",
             "detected_kw": float(detected_loads.get("measured_house_kw", 0.0) or 0.0),
             "threshold_kw": 0.2,
             "message": "Chtěli jste přídavnou zátěž, ale po 15 minutách není detekována.",
@@ -1226,7 +1280,7 @@ def update_planned_load_watch(
     )
     for spec in specs:
         kind = spec["kind"]
-        planned_kw = _planned_power_kw(current_slot, spec["planned_key"], cfg)
+        planned_kw = _planned_watch_power_kw(current_slot, kind, cfg)
         prior = previous_watch.get(kind) if isinstance(previous_watch.get(kind), dict) else {}
         planned_start = None
         if planned_kw > 0.05:
@@ -1239,7 +1293,11 @@ def update_planned_load_watch(
         elif prior.get("state") == "waiting":
             prior_start = _parse_watch_datetime(prior.get("planned_start"), now)
             next_start = _forecast_planned_start(forecast_doc, now=now, kind=kind, cfg=cfg)
-            candidates = [value for value in (prior_start, next_start) if value is not None]
+            prior_still_planned = (
+                prior_start is not None
+                and _forecast_has_planned_start(forecast_doc, planned_start=prior_start, kind=kind, cfg=cfg)
+            )
+            candidates = [value for value in (prior_start if prior_still_planned else None, next_start) if value is not None]
             planned_start = max(candidates) if candidates else None
         else:
             next_start = _forecast_planned_start(forecast_doc, now=now, kind=kind, cfg=cfg)

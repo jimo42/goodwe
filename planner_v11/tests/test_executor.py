@@ -444,6 +444,70 @@ def test_planned_load_watch_alerts_after_later_rescheduled_ev_start():
     assert ev_watch["missing"] is True
 
 
+def test_planned_load_watch_ignores_detector_only_additional_load_projection():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 4, 15, 28, tzinfo=tz)
+    slot = {
+        "slot_start": "2026-09-04T15:15:00+02:00",
+        "ev_load_kwh": 0.0,
+        "additional_load_kwh": 0.5,
+        "additional_load_breakdown": {
+            "announced_kw": 0.0,
+            "announced_kwh": 0.0,
+            "detector_adjustment_kw": 2.0,
+            "detector_adjustment_kwh": 0.5,
+            "unannounced_ev_kw": 0.0,
+            "unannounced_ev_kwh": 0.0,
+        },
+    }
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "measured_house_kw": 0.837,
+        "planned_load_watch": {
+            "additional_load": {
+                "state": "waiting",
+                "planned_start": "2026-09-04T15:00:00+02:00",
+                "alert_due_at": "2026-09-04T15:15:00+02:00",
+                "alert_key": "executor.planned_load_missing.additional_load.2026-09-04T15:00:00+02:00",
+            }
+        },
+    }
+
+    out = executor.update_planned_load_watch(detected, forecast_doc={"slots": [slot]}, current_slot=slot, now=now, cfg=cfg)
+
+    add_watch = out["planned_load_watch"]["additional_load"]
+    assert add_watch == {"state": "idle", "planned_start": None, "alert_due_at": None, "alert_key": None}
+
+
+def test_planned_load_watch_tracks_announced_additional_load_breakdown():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 4, 15, 28, tzinfo=tz)
+    slot = {
+        "slot_start": "2026-09-04T15:00:00+02:00",
+        "ev_load_kwh": 0.0,
+        "additional_load_kwh": 0.5,
+        "additional_load_breakdown": {
+            "announced_kw": 2.0,
+            "announced_kwh": 0.5,
+            "detector_adjustment_kw": 0.0,
+            "detector_adjustment_kwh": 0.0,
+            "unannounced_ev_kw": 0.0,
+            "unannounced_ev_kwh": 0.0,
+        },
+    }
+    detected = {"ev": {"detected_kw": 0.0}, "measured_house_kw": 0.837}
+
+    out = executor.update_planned_load_watch(detected, forecast_doc={"slots": [slot]}, current_slot=slot, now=now, cfg=cfg)
+
+    add_watch = out["planned_load_watch"]["additional_load"]
+    assert add_watch["planned_start"] == "2026-09-04T15:00:00+02:00"
+    assert add_watch["planned_kw"] == 2.0
+    assert add_watch["missing"] is True
+    assert add_watch["message"] == "Chtěli jste přídavnou zátěž, ale po 15 minutách není detekována."
+
+
 def test_send_executor_alerts_for_missing_planned_load():
     cfg = _cfg()
     now = datetime(2026, 9, 4, 12, 30, tzinfo=ZoneInfo(cfg.system.timezone))
