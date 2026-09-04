@@ -325,11 +325,13 @@ def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_impor
 def test_curtailment_probe_blocks_stale_data_and_cancels_when_relay_mask_changes():
     cfg = _probe_cfg()
     now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
-    assert executor.curtailment_probe_transition(
+    blocked = executor.curtailment_probe_transition(
         current_mask=(False, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(), telemetry_evidence=_probe_telemetry(fresh=False),
         ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), now=now, cfg=cfg,
-    ) is None
+    )
+    assert blocked["kind"] == "blocked"
+    assert blocked["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_TELEMETRY_STALE"
     state = boiler_state.empty_state()
     state["curtailment_probe"].update({
         "status": "observing", "observe_after": (now + timedelta(minutes=5)).isoformat(),

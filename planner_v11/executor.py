@@ -1039,6 +1039,41 @@ def soc_deviation_alert_message(deviation_reason: str, actual_soc: Optional[floa
     return f"FVE ALERT: významná odchylka: {deviation_reason}"
 
 
+def detect_boiler_full_completion(
+    ledger: dict, telemetry_evidence: dict, *, now: datetime,
+) -> dict:
+    """Detect the first robust thermostat stop of the local day."""
+
+    day = boiler_state.today_entry(ledger, now.date())
+    previous_kw = float(day.get("previous_confirmed_delivery_kw", 0.0) or 0.0)
+    confirmed_raw = telemetry_evidence.get("confirmed_boiler_delivery_kw")
+    sample_count = int(telemetry_evidence.get("sample_count", 0) or 0)
+    current_mask = ledger.get("current_mask", [])
+    try:
+        confirmed_kw = float(confirmed_raw)
+    except (TypeError, ValueError):
+        confirmed_kw = 0.0
+    detected_now = (
+        not day.get("full_detected_at")
+        and sample_count >= 3
+        and any(bool(value) for value in current_mask[:3])
+        and previous_kw >= 1.0
+        and confirmed_kw <= 0.25
+    )
+    if detected_now:
+        day["full_detected_at"] = now.isoformat()
+    day["previous_confirmed_delivery_kw"] = round(confirmed_kw, 6)
+    return {
+        "detected_now": detected_now,
+        "detected_at": day.get("full_detected_at"),
+        "notification_sent_at": day.get("full_notification_sent_at"),
+        "estimated_delivered_kwh": round(float(day.get("estimated_delivered_kwh", 0.0) or 0.0), 3),
+        "previous_confirmed_delivery_kw": round(previous_kw, 3),
+        "confirmed_delivery_kw": round(confirmed_kw, 3),
+        "sample_count": sample_count,
+    }
+
+
 def detect_runtime_loads(
     *,
     now: datetime,
@@ -1548,6 +1583,8 @@ def run_executor(
         samples, accounting_mask, cfg.boiler.phase_power_kw, now=now,
         persisted_phase_baseline_kw=ledger.get("phase_baseline_kw"),
     )
+    boiler_completion = detect_boiler_full_completion(ledger, telemetry_evidence, now=now)
+    ledger["boiler_full_completion"] = boiler_completion
     export_limit_state = read_export_limit_state() if forecast_valid else {
         "status": "not_read_invalid_forecast", "zero_export_active": False,
     }

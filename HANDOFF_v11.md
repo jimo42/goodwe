@@ -1,3 +1,15 @@
+## Update 2026-09-04 — boiler redesign suite cleanup
+
+- Opraveny dvě dlouhodobé regrese ve full `tests/run_manual.py`:
+  - `executor.py v3.1`: obnovena detekce prvního denního thermostat stopu bojleru
+    (`detect_boiler_full_completion`) a její zapojení do ledgeru, aby současná
+    retry-safe notifikace `Bojler je nahřátý naplno...` měla zdrojový signál.
+  - `tests/test_boiler_redesign.py`: očekávání stale curtailment-probe telemetry
+    sladěno s novějším explicitním bezpečným stavem `blocked` /
+    `BOILER_EXPORT_CURTAILMENT_PROBE_TELEMETRY_STALE` místo starého tichého `None`.
+- Přidán cílený regression test, že detekce boiler-full napájí notification marker
+  v aktuálním `send_executor_alerts` flow.
+
 ## Update 2026-09-04 — drobné provozní notifikace a WhatsApp replan
 
 - Připraveny/nasazeny změny:
@@ -23,8 +35,8 @@
   samostatný targeted runner pro `test_show_status.py`, `test_daily_report.py`,
   `test_whatsapp_request_worker.py`, `test_executor.py`, `test_ev_session.py`:
   **65/65 passed**.
-- Full `tests/run_manual.py` pořád není deploy gate kvůli dříve známým nesouvisejícím
-  selháním `test_boiler_redesign.py`.
+- Dříve známá nesouvisející selhání `test_boiler_redesign.py` byla následně řešena
+  v samostatném boiler cleanup commitu.
 
 ## Curtailment probe v3.0 aktivován (2026-08-16 10:54 CEST)
 

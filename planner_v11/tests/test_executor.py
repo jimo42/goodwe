@@ -137,6 +137,51 @@ def test_boiler_execution_uses_relay_adapter_after_write_gate(monkeypatch=None):
     assert calls == [((True, True, False), cfg)]
 
 
+def test_boiler_full_completion_detection_feeds_notification():
+    cfg = _cfg()
+    now = datetime(2026, 8, 10, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    ledger = executor.boiler_state.empty_state()
+    ledger["current_mask"] = [True, False, False]
+    day = executor.boiler_state.today_entry(ledger, now.date())
+    day["estimated_delivered_kwh"] = 8.236
+    day["previous_confirmed_delivery_kw"] = 1.955
+
+    completion = executor.detect_boiler_full_completion(
+        ledger,
+        {"confirmed_boiler_delivery_kw": 0.043, "sample_count": 5},
+        now=now,
+    )
+
+    assert completion["detected_now"] is True
+    assert day["full_detected_at"] == now.isoformat()
+
+    calls = []
+    original = executor.alerting.notify.send
+    executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v10_test_boiler_full_notification_")
+    try:
+        outcomes = executor.send_executor_alerts(
+            now=now,
+            cfg=cfg,
+            forecast_valid=True,
+            forecast_reasons=[],
+            boiler_decision={"status": "blocked_by_dry_run_or_write_gate"},
+            relay_health={"relay_status_ok": True},
+            detected_loads={"unexpected_load": {"active": False}},
+            deviation_detected=False,
+            deviation_reason="SOC_DEVIATION_OK_0.0_PCT_POINTS",
+            boiler_ledger=ledger,
+            alert_state_path=Path(tmp) / "alert_state.json",
+        )
+    finally:
+        executor.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert len(outcomes) == 1
+    assert calls == ["Bojler je nahřátý naplno, dnes spotřeboval zhruba 8.2 kWh."]
+    assert day["full_notification_sent_at"] == now.isoformat()
+
+
 def test_build_runtime_state_contract():
     cfg = _cfg({"system": {"dry_run": True, "battery_write_enabled": False, "boiler_write_enabled": False}})
     now = datetime(2026, 7, 22, 15, 0, tzinfo=ZoneInfo(cfg.system.timezone))
