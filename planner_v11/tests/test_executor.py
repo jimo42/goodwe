@@ -444,6 +444,84 @@ def test_planned_load_watch_alerts_after_later_rescheduled_ev_start():
     assert ev_watch["missing"] is True
 
 
+def test_planned_load_watch_waits_after_detected_ev_temporarily_drops_out():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    slot = {
+        "slot_start": "2026-09-05T13:30:00+02:00",
+        "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+        "additional_load_kwh": 0.0,
+    }
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "planned_load_watch": {
+            "ev": {
+                "state": "detected",
+                "planned_start": "2026-09-05T13:00:00+02:00",
+                "alert_due_at": "2026-09-05T13:15:00+02:00",
+                "detected_kw": cfg.ev.planning_power_kw,
+                "planned_kw": cfg.ev.planning_power_kw,
+                "missing": False,
+                "alert_key": "executor.planned_load_missing.ev.2026-09-05T13:00:00+02:00",
+            }
+        },
+    }
+
+    out = executor.update_planned_load_watch(
+        detected,
+        forecast_doc={"slots": [slot]},
+        current_slot=slot,
+        now=datetime(2026, 9, 5, 13, 43, tzinfo=tz),
+        cfg=cfg,
+    )
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["state"] == "waiting"
+    assert ev_watch["undetected_since"] == "2026-09-05T13:43:00+02:00"
+    assert ev_watch["alert_due_at"] == "2026-09-05T13:58:00+02:00"
+    assert ev_watch["missing"] is False
+
+
+def test_planned_load_watch_alerts_after_continuous_ev_dropout_grace_period():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    slot = {
+        "slot_start": "2026-09-05T13:45:00+02:00",
+        "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+        "additional_load_kwh": 0.0,
+    }
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "planned_load_watch": {
+            "ev": {
+                "state": "waiting",
+                "planned_start": "2026-09-05T13:00:00+02:00",
+                "alert_due_at": "2026-09-05T13:58:00+02:00",
+                "detected_kw": 0.0,
+                "planned_kw": cfg.ev.planning_power_kw,
+                "missing": False,
+                "alert_key": "executor.planned_load_missing.ev.2026-09-05T13:00:00+02:00",
+                "ever_detected": True,
+                "undetected_since": "2026-09-05T13:43:00+02:00",
+            }
+        },
+    }
+
+    out = executor.update_planned_load_watch(
+        detected,
+        forecast_doc={"slots": [slot]},
+        current_slot=slot,
+        now=datetime(2026, 9, 5, 13, 59, tzinfo=tz),
+        cfg=cfg,
+    )
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["state"] == "waiting"
+    assert ev_watch["undetected_since"] == "2026-09-05T13:43:00+02:00"
+    assert ev_watch["alert_due_at"] == "2026-09-05T13:58:00+02:00"
+    assert ev_watch["missing"] is True
+
+
 def test_planned_load_watch_ignores_detector_only_additional_load_projection():
     cfg = _cfg()
     tz = ZoneInfo(cfg.system.timezone)

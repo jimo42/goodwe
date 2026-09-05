@@ -1304,14 +1304,29 @@ def update_planned_load_watch(
             if next_start is not None and next_start <= now:
                 planned_start = next_start
 
-        if planned_start is None:
-            watch[kind] = {"state": "idle", "planned_start": None, "alert_due_at": None, "alert_key": None}
-            continue
-        due_at = planned_start + timedelta(minutes=PLANNED_LOAD_MISSING_GRACE_MINUTES)
         if kind == "additional_load":
             detected = float(spec["detected_kw"]) >= max(float(spec["threshold_kw"]), planned_kw * 0.5)
         else:
             detected = float(spec["detected_kw"]) >= float(spec["threshold_kw"])
+
+        if planned_start is None:
+            watch[kind] = {"state": "idle", "planned_start": None, "alert_due_at": None, "alert_key": None}
+            continue
+
+        prior_ever_detected = bool(prior.get("ever_detected") or prior.get("state") == "detected")
+        ever_detected = prior_ever_detected or detected
+        undetected_since: Optional[datetime] = None
+        if detected:
+            due_at = planned_start + timedelta(minutes=PLANNED_LOAD_MISSING_GRACE_MINUTES)
+        elif ever_detected:
+            undetected_since = _parse_watch_datetime(prior.get("undetected_since"), now)
+            if undetected_since is None or prior.get("state") == "detected":
+                undetected_since = now
+            due_at = undetected_since + timedelta(minutes=PLANNED_LOAD_MISSING_GRACE_MINUTES)
+        else:
+            undetected_since = planned_start
+            due_at = planned_start + timedelta(minutes=PLANNED_LOAD_MISSING_GRACE_MINUTES)
+
         state = "detected" if detected else "waiting"
         alert_key = f"executor.planned_load_missing.{kind}.{planned_start.isoformat()}"
         watch[kind] = {
@@ -1323,6 +1338,8 @@ def update_planned_load_watch(
             "missing": (not detected) and now >= due_at,
             "alert_key": alert_key,
             "message": spec["message"],
+            "ever_detected": ever_detected,
+            "undetected_since": _dt_iso(undetected_since) if undetected_since is not None else None,
         }
     detected_loads["planned_load_watch"] = watch
     return detected_loads
