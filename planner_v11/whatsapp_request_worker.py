@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Process validated WhatsApp requests from the spool into planner_v11.
 
-VERSION = "1.8"
+VERSION = "1.9"
 
 Changelog:
+- v1.9 (2026-09-15): Send a final WhatsApp result after standalone `replan`
+  commands finish, including failure notifications.
 - v1.8 (2026-09-04): Accept validated `replan` WhatsApp commands and omit the
   "Zatím bez doporučeného okna" prefix for completed EV requests.
 - v1.7 (2026-08-14): Accept only optimal correlated replans and stop retrying
@@ -50,10 +52,11 @@ from lib import request_store
 MAX_EV_SESSION_KWH = 9.0
 
 
-VERSION = "1.8"
+VERSION = "1.9"
 
 PLANNER_REPLAN_MAX_ATTEMPTS = 2
 PLANNER_REPLAN_RETRY_SECONDS = 5.0
+PLANNER_REPLAN_TIMEOUT_SECONDS = 20 * 60
 PLANNER_NONOPTIMAL_EXIT_CODE = 4
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -318,6 +321,30 @@ def start_async_request_planning(
     log(f"async request planning started for {request_path.name}", paths, verbose=verbose)
 
 
+def start_async_replan_completion(
+    request_path: Path,
+    paths: WorkerPaths,
+    *,
+    not_before: datetime,
+    verbose: bool = True,
+) -> None:
+    """Start a detached helper that completes a standalone replan command."""
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--finish-replan-command",
+        str(request_path),
+        "--replan-not-before",
+        not_before.isoformat(),
+        *_helper_command(paths),
+    ]
+    if not verbose:
+        cmd.append("--quiet")
+    subprocess.Popen(cmd, cwd=str(PLANNER_DIR), close_fds=True)
+    log(f"async replan completion started for {request_path.name}", paths, verbose=verbose)
+
+
 def parse_optional_dt(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -485,6 +512,7 @@ def run_planner_replan(
     verbose: bool = True,
     max_attempts: int = PLANNER_REPLAN_MAX_ATTEMPTS,
     retry_seconds: float = PLANNER_REPLAN_RETRY_SECONDS,
+    timeout_seconds: float = PLANNER_REPLAN_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
     """Run planner until a fresh, request-correlated forecast is available."""
 
@@ -502,9 +530,16 @@ def run_planner_replan(
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     check=False,
+                    timeout=timeout_seconds,
                 )
         except OSError as exc:
             log(f"planner replan attempt {attempt}/{attempts} failed: {exc}", paths, verbose=verbose)
+        except subprocess.TimeoutExpired as exc:
+            log(
+                f"planner replan attempt {attempt}/{attempts} timed out after {exc.timeout:g} seconds",
+                paths,
+                verbose=verbose,
+            )
         else:
             if result.returncode == 0:
                 forecast = read_json(paths.forecast_path, {})
@@ -733,6 +768,52 @@ def finish_request_planning(
     log(f"completed deferred request planning {request_path.name}", paths, verbose=verbose)
 
 
+def finish_replan_command(
+    request_path: Path,
+    paths: WorkerPaths,
+    *,
+    not_before: datetime,
+    verbose: bool = True,
+) -> None:
+    """Run a standalone replan command and send its final WhatsApp result."""
+
+    try:
+        payload = load_request(request_path)
+        _request_id, _message_id, _sender_id, commands, _created_at = validate_envelope(payload)
+        if commands[0] != "replan":
+            raise RequestError("Interní dokončení replan dostalo jiný příkaz než replan.")
+        forecast = run_planner_replan(
+            paths,
+            request_id=None,
+            not_before=not_before,
+            verbose=verbose,
+        )
+        if forecast is None:
+            reply = "Mimořádný přepočet se nepodařilo potvrdit. Detail je v logu planneru."
+        else:
+            reply = "Mimořádný přepočet plánu je hotový. Nový plán je optimální."
+        reply_to_request(reply, request_path, paths)
+    except RequestError as exc:
+        reply = f"Finální výsledek přepočtu se nepodařilo vytvořit: {exc}"
+        log(f"deferred replan error for {request_path}: {exc}", paths, verbose=verbose)
+        try:
+            reply_to_request(reply, request_path, paths)
+        finally:
+            move_request(request_path, paths.spool_dir, "failed")
+        return
+    except Exception as exc:  # noqa: BLE001 - detached helper logs full diagnostics.
+        reply = "Finální výsledek přepočtu selhal kvůli technické chybě. Detail je v logu."
+        log(f"deferred replan technical error for {request_path}: {exc}\n{traceback.format_exc()}", paths, verbose=verbose)
+        try:
+            reply_to_request(reply, request_path, paths)
+        finally:
+            move_request(request_path, paths.spool_dir, "failed")
+        return
+
+    move_request(request_path, paths.spool_dir, "done")
+    log(f"completed deferred replan command {request_path.name}", paths, verbose=verbose)
+
+
 def build_store_request(command: str, request_id: str, created_at: str) -> tuple[dict[str, Any], bool, str]:
     match = CHARGE_CAR_RE.match(command)
     if match:
@@ -839,10 +920,27 @@ def process_claimed(path: Path, paths: WorkerPaths, *, verbose: bool = True) -> 
     if command == "requests":
         return ProcessOutcome(True, build_requests_reply(paths))
     if command == "replan":
-        started = trigger_planner_replan(paths, verbose=verbose)
-        if started:
-            return ProcessOutcome(True, "ok, spouštím mimořádný přepočet plánu.")
-        return ProcessOutcome(True, "Přepočet se teď nepodařilo spustit. Detail je v logu.")
+        replan_started_at = datetime.now().astimezone()
+        ack = "ok, spouštím mimořádný přepočet plánu. Výsledek pošlu po dokončení."
+        if paths.async_planning:
+            reply_to_request(ack, path, paths)
+            start_async_replan_completion(
+                path,
+                paths,
+                not_before=replan_started_at,
+                verbose=verbose,
+            )
+            return ProcessOutcome(True, None, deferred=True)
+        reply_to_request(ack, path, paths)
+        forecast = run_planner_replan(
+            paths,
+            request_id=None,
+            not_before=replan_started_at,
+            verbose=verbose,
+        )
+        if forecast is None:
+            return ProcessOutcome(True, "Mimořádný přepočet se nepodařilo potvrdit. Detail je v logu planneru.")
+        return ProcessOutcome(True, "Mimořádný přepočet plánu je hotový. Nový plán je optimální.")
 
     match = CANCEL_RE.match(command)
     if match:
@@ -971,6 +1069,7 @@ def main() -> int:
     parser.add_argument("--forecast-path", type=Path, default=DEFAULT_FORECAST_PATH)
     parser.add_argument("--send-status-reply", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--finish-request-planning", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--finish-replan-command", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--replan-not-before", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-requests", type=int, default=20, help="Maximum requests processed per run")
     parser.add_argument("--poll-iterations", type=int, default=5, help="How many polling cycles to run before exiting")
@@ -1000,6 +1099,19 @@ def main() -> int:
             return 2
         finish_request_planning(
             args.finish_request_planning,
+            paths,
+            not_before=not_before,
+            verbose=not args.quiet,
+        )
+        return 0
+
+    if args.finish_replan_command is not None:
+        not_before = parse_optional_dt(args.replan_not_before)
+        if not_before is None:
+            print("CHYBA: --finish-replan-command vyžaduje platný --replan-not-before", file=sys.stderr)
+            return 2
+        finish_replan_command(
+            args.finish_replan_command,
             paths,
             not_before=not_before,
             verbose=not args.quiet,

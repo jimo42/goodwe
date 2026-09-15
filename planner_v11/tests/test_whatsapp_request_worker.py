@@ -117,6 +117,29 @@ def _make_planner_script(
     return script
 
 
+def _make_standalone_replan_script(root: Path, *, exit_code: int = 0, solver_status: str = "optimal") -> Path:
+    script = root / "standalone-replan.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "from datetime import datetime\n"
+        f"root = pathlib.Path({str(root)!r})\n"
+        "count_path = root / 'planner-count.txt'\n"
+        "count = int(count_path.read_text() or '0') + 1 if count_path.exists() else 1\n"
+        "count_path.write_text(str(count), encoding='utf-8')\n"
+        f"if {exit_code!r}:\n"
+        f"    raise SystemExit({exit_code!r})\n"
+        "forecast = {'generated_at': datetime.now().astimezone().isoformat(), "
+        f"'solver': {{'status': {solver_status!r}}}, "
+        "'active_requests': [], 'slots': []}\n"
+        "(root / 'forecast_48h.json').write_text(json.dumps(forecast), encoding='utf-8')\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    os.chmod(script, 0o755)
+    return script
+
+
 def _paths(root: Path, spool: Path) -> worker.WorkerPaths:
     return worker.WorkerPaths(
         spool_dir=spool,
@@ -550,6 +573,46 @@ def test_forecast_correlation_rejects_nonoptimal_solver_status():
     ) is False
 
 
+def test_replan_timeout_returns_failure_instead_of_hanging():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        script = root / "planner-timeout.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(5)\n",
+            encoding="utf-8",
+        )
+        os.chmod(script, 0o755)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=script,
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        result = worker.run_planner_replan(
+            paths,
+            request_id=None,
+            not_before=datetime.now().astimezone() - timedelta(seconds=1),
+            verbose=False,
+            max_attempts=1,
+            retry_seconds=0,
+            timeout_seconds=0.1,
+        )
+        assert result is None
+        assert "timed out" in paths.log_path.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_replan_does_not_retry_nonoptimal_solver_exit():
     tmp = _tmpdir()
     try:
@@ -683,9 +746,9 @@ def test_build_store_request_caps_ev_at_nine_and_preserves_original():
     assert "12 kWh" in reply
 
 
-def test_replan_command_triggers_async_planner():
+def test_replan_command_gets_immediate_ack_and_defers_final_result():
     tmp = _tmpdir()
-    original = worker.trigger_planner_replan
+    original = worker.start_async_replan_completion
     calls = []
     try:
         root = Path(tmp)
@@ -700,20 +763,84 @@ def test_replan_command_triggers_async_planner():
             planner_log_path=root / "planner.log",
             forecast_path=root / "forecast_48h.json",
             async_status=False,
-            async_planning=False,
+            async_planning=True,
         )
         _write_request(spool, "replan.json", "replan", "replan-1")
 
-        def fake_trigger(worker_paths, *, verbose=True):
-            calls.append((worker_paths, verbose))
-            return True
+        def fake_start(path, worker_paths, *, not_before, verbose=True):
+            calls.append((path, worker_paths, not_before, verbose))
 
-        worker.trigger_planner_replan = fake_trigger
+        worker.start_async_replan_completion = fake_start
         assert worker.process_one(paths, verbose=False) is True
+        assert (spool / "processing" / "replan.json").exists()
+        assert not (spool / "done" / "replan.json").exists()
         assert len(calls) == 1
-        assert "spouštím mimořádný přepočet" in _reply_log(spool)
+        reply = _reply_log(spool)
+        assert "spouštím mimořádný přepočet" in reply
+        assert "Výsledek pošlu po dokončení" in reply
     finally:
-        worker.trigger_planner_replan = original
+        worker.start_async_replan_completion = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_replan_command_sends_final_success_result_after_planner_finishes():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_standalone_replan_script(root),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        _write_request(spool, "replan-success.json", "replan", "replan-success")
+
+        assert worker.process_one(paths, verbose=False) is True
+
+        reply = _reply_log(spool)
+        assert "spouštím mimořádný přepočet" in reply
+        assert "Mimořádný přepočet plánu je hotový" in reply
+        assert "Nový plán je optimální" in reply
+        assert (root / "planner-count.txt").read_text(encoding="utf-8") == "1"
+        assert (spool / "done" / "replan-success.json").exists()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_replan_command_sends_final_failure_result_after_planner_error():
+    tmp = _tmpdir()
+    try:
+        root = Path(tmp)
+        spool = _make_spool(root)
+        paths = worker.WorkerPaths(
+            spool_dir=spool,
+            requests_path=root / "requests.json",
+            reply_script=_make_reply_script(root),
+            show_status_script=_make_status_script(root),
+            log_path=root / "worker.log",
+            planner_script=_make_standalone_replan_script(root, exit_code=3),
+            planner_log_path=root / "planner.log",
+            forecast_path=root / "forecast_48h.json",
+            async_status=False,
+            async_planning=False,
+        )
+        _write_request(spool, "replan-failure.json", "replan", "replan-failure")
+
+        assert worker.process_one(paths, verbose=False) is True
+
+        reply = _reply_log(spool)
+        assert "spouštím mimořádný přepočet" in reply
+        assert "Mimořádný přepočet se nepodařilo potvrdit" in reply
+        assert (root / "planner-count.txt").read_text(encoding="utf-8") == "2"
+        assert (spool / "done" / "replan-failure.json").exists()
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
