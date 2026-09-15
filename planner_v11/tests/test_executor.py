@@ -522,6 +522,99 @@ def test_planned_load_watch_alerts_after_continuous_ev_dropout_grace_period():
     assert ev_watch["missing"] is True
 
 
+def test_planned_load_watch_does_not_alert_for_completed_ev_request_tail_slot():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 15, 15, 18, tzinfo=tz)
+    slot = {
+        "slot_start": "2026-09-15T15:15:00+02:00",
+        "ev_load_kwh": 0.0425,
+        "additional_load_kwh": 0.0,
+    }
+    forecast = {
+        "active_requests": [{
+            "id": "99fa8637-cba4-414e-9eb2-c25b99c97806",
+            "type": "ev_charge",
+            "required_ac_kwh": 8.0,
+            "delivered_kwh": 8.27,
+            "request_remaining_kwh": 0.0,
+            "session_id": "ev-20260915T113301+0200",
+        }],
+        "ev_charging_session": {
+            "request_id": "99fa8637-cba4-414e-9eb2-c25b99c97806",
+            "session_id": "ev-20260915T113301+0200",
+            "started_at": "2026-09-15T11:33:01+02:00",
+            "last_active_at": "2026-09-15T15:03:02+02:00",
+            "effective_target_kwh": 8.0,
+            "delivered_kwh": 8.27,
+            "request_remaining_kwh": 0.0,
+            "request_credited_kwh": 8.0,
+        },
+        "slots": [slot],
+    }
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "planned_load_watch": {
+            "ev": {
+                "state": "waiting",
+                "planned_start": "2026-09-15T15:00:00+02:00",
+                "alert_due_at": "2026-09-15T15:15:00+02:00",
+                "missing": False,
+            }
+        },
+    }
+
+    out = executor.update_planned_load_watch(detected, forecast_doc=forecast, current_slot=slot, now=now, cfg=cfg)
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["state"] == "idle"
+    assert ev_watch.get("missing") is not True
+    assert ev_watch["request_complete"] is True
+    assert ev_watch["ever_detected"] is True
+    assert ev_watch["request_id"] == "99fa8637-cba4-414e-9eb2-c25b99c97806"
+
+
+def test_planned_load_watch_carries_observed_ev_session_across_idle_gap():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 15, 15, 18, tzinfo=tz)
+    slot = {
+        "slot_start": "2026-09-15T15:15:00+02:00",
+        "ev_load_kwh": 0.5,
+        "additional_load_kwh": 0.0,
+    }
+    forecast = {
+        "active_requests": [{
+            "id": "ev-request",
+            "type": "ev_charge",
+            "required_ac_kwh": 8.0,
+            "delivered_kwh": 6.0,
+            "request_remaining_kwh": 2.0,
+            "session_id": "ev-session",
+        }],
+        "ev_charging_session": {
+            "request_id": "ev-request",
+            "session_id": "ev-session",
+            "started_at": "2026-09-15T11:33:01+02:00",
+            "last_active_at": "2026-09-15T14:43:02+02:00",
+            "effective_target_kwh": 8.0,
+            "delivered_kwh": 6.0,
+            "request_remaining_kwh": 2.0,
+        },
+        "slots": [slot],
+    }
+    detected = {"ev": {"detected_kw": 0.0}, "planned_load_watch": {"ev": {"state": "idle"}}}
+
+    out = executor.update_planned_load_watch(detected, forecast_doc=forecast, current_slot=slot, now=now, cfg=cfg)
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["state"] == "waiting"
+    assert ev_watch["ever_detected"] is True
+    assert ev_watch["undetected_since"] == "2026-09-15T15:18:00+02:00"
+    assert ev_watch["alert_due_at"] == "2026-09-15T15:33:00+02:00"
+    assert ev_watch["missing"] is False
+
+
 def test_planned_load_watch_ignores_detector_only_additional_load_projection():
     cfg = _cfg()
     tz = ZoneInfo(cfg.system.timezone)

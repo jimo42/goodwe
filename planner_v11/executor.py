@@ -1165,6 +1165,71 @@ def _parse_watch_datetime(raw: Any, now: datetime) -> Optional[datetime]:
     return dt
 
 
+def _watch_float(raw: Any) -> Optional[float]:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ev_watch_context(forecast_doc: Optional[dict]) -> dict[str, Any]:
+    """Return EV request/session metadata relevant for missing-load alerts."""
+
+    if not isinstance(forecast_doc, dict):
+        return {}
+
+    session = forecast_doc.get("ev_charging_session")
+    session = session if isinstance(session, dict) else {}
+    active_request: dict[str, Any] = {}
+    requests = forecast_doc.get("active_requests", [])
+    if isinstance(requests, list):
+        for item in requests:
+            if isinstance(item, dict) and item.get("type") == "ev_charge":
+                active_request = item
+                break
+
+    request_id = (
+        session.get("request_id")
+        or active_request.get("id")
+        or active_request.get("request_id")
+    )
+    required_kwh = _watch_float(active_request.get("required_ac_kwh"))
+    if required_kwh is None:
+        required_kwh = _watch_float(session.get("effective_target_kwh"))
+    delivered_kwh = _watch_float(active_request.get("delivered_kwh"))
+    if delivered_kwh is None:
+        delivered_kwh = _watch_float(session.get("delivered_kwh"))
+    request_remaining_kwh = _watch_float(active_request.get("request_remaining_kwh"))
+    if request_remaining_kwh is None:
+        request_remaining_kwh = _watch_float(session.get("request_remaining_kwh"))
+    request_credited_kwh = _watch_float(session.get("request_credited_kwh"))
+
+    request_complete = False
+    if request_remaining_kwh is not None and request_remaining_kwh <= 0.05:
+        request_complete = True
+    if required_kwh is not None:
+        if delivered_kwh is not None and delivered_kwh >= max(0.0, required_kwh - 0.05):
+            request_complete = True
+        if request_credited_kwh is not None and request_credited_kwh >= max(0.0, required_kwh - 0.05):
+            request_complete = True
+
+    observed = bool(session.get("started_at") or session.get("last_active_at"))
+    if delivered_kwh is not None and delivered_kwh > 0.05:
+        observed = True
+
+    return {
+        "request_id": str(request_id) if request_id else None,
+        "session_id": session.get("session_id") or active_request.get("session_id"),
+        "request_complete": request_complete,
+        "observed": observed,
+        "started_at": session.get("started_at"),
+        "last_active_at": session.get("last_active_at"),
+        "request_remaining_kwh": request_remaining_kwh,
+        "delivered_kwh": delivered_kwh,
+        "required_kwh": required_kwh,
+    }
+
+
 def _forecast_planned_start(
     forecast_doc: Optional[dict],
     *,
@@ -1263,6 +1328,7 @@ def update_planned_load_watch(
         return detected_loads
     previous_watch = detected_loads.get("planned_load_watch", {})
     previous_watch = previous_watch if isinstance(previous_watch, dict) else {}
+    ev_context = _ev_watch_context(forecast_doc)
     watch: dict[str, dict[str, Any]] = {}
     specs = (
         {
@@ -1282,6 +1348,21 @@ def update_planned_load_watch(
         kind = spec["kind"]
         planned_kw = _planned_watch_power_kw(current_slot, kind, cfg)
         prior = previous_watch.get(kind) if isinstance(previous_watch.get(kind), dict) else {}
+
+        if kind == "ev" and ev_context.get("request_complete"):
+            watch[kind] = {
+                "state": "idle",
+                "planned_start": None,
+                "alert_due_at": None,
+                "alert_key": None,
+                "request_id": ev_context.get("request_id"),
+                "session_id": ev_context.get("session_id"),
+                "request_complete": True,
+                "ever_detected": True,
+                "undetected_since": None,
+            }
+            continue
+
         planned_start = None
         if planned_kw > 0.05:
             current_start = _forecast_active_window_start(forecast_doc, now=now, kind=kind, cfg=cfg)
@@ -1314,6 +1395,8 @@ def update_planned_load_watch(
             continue
 
         prior_ever_detected = bool(prior.get("ever_detected") or prior.get("state") == "detected")
+        if kind == "ev" and ev_context.get("observed"):
+            prior_ever_detected = True
         ever_detected = prior_ever_detected or detected
         undetected_since: Optional[datetime] = None
         if detected:
@@ -1341,6 +1424,12 @@ def update_planned_load_watch(
             "ever_detected": ever_detected,
             "undetected_since": _dt_iso(undetected_since) if undetected_since is not None else None,
         }
+        if kind == "ev":
+            watch[kind].update({
+                "request_id": ev_context.get("request_id"),
+                "session_id": ev_context.get("session_id"),
+                "request_complete": bool(ev_context.get("request_complete")),
+            })
     detected_loads["planned_load_watch"] = watch
     return detected_loads
 
