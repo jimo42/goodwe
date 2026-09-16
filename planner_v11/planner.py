@@ -61,7 +61,7 @@ import os
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -864,7 +864,29 @@ def live_state_from_runtime_sensors(out: dict) -> dict:
     }
 
 
+def battery_available(cfg: Config) -> bool:
+    return bool(getattr(cfg.battery, "enabled", True))
+
+
+def no_battery_config(cfg: Config) -> Config:
+    """Return an effective planning config with all battery flows disabled."""
+    if battery_available(cfg):
+        return cfg
+    return replace(cfg, battery=replace(
+        cfg.battery,
+        capacity_kwh=0.0,
+        min_soc_pct=0.0,
+        max_soc_pv_pct=0.0,
+        max_soc_grid_pct=0.0,
+        max_charge_kw=0.0,
+        max_discharge_kw=0.0,
+        terminal_value_lookahead_hours=0.0,
+    ))
+
+
 def soc_pct_to_kwh(soc_pct: float, cfg: Config) -> float:
+    if not battery_available(cfg):
+        return 0.0
     return max(0.0, min(100.0, soc_pct)) / 100.0 * cfg.battery.capacity_kwh
 
 
@@ -941,8 +963,10 @@ def build_forecast_document(
             })
             continue
 
-        bp_kw = battery_power_kw(r, cfg)
+        bp_kw = battery_power_kw(r, cfg) if battery_available(cfg) else 0.0
         boiler_power_kw = sum(1 for on in r.boiler_phase_on if on) * cfg.boiler.phase_power_kw
+        soc_start_pct = round(r.soc_start_kwh / capacity * 100.0, 3) if battery_available(cfg) and capacity > 0 else None
+        soc_end_pct = round(r.soc_end_kwh / capacity * 100.0, 3) if battery_available(cfg) and capacity > 0 else None
         slots_json.append({
             "slot_start": m.slot_start.isoformat(),
             "price_eur_mwh": round(m.price_eur_mwh, 4),
@@ -959,8 +983,8 @@ def build_forecast_document(
             "additional_load_breakdown": additional_load_breakdown_for_slot(
                 m.slot_start, cfg.system.planning_step_minutes, additional_requests, detected_loads
             ),
-            "soc_start_pct": round(r.soc_start_kwh / capacity * 100.0, 3),
-            "soc_end_pct": round(r.soc_end_kwh / capacity * 100.0, 3),
+            "soc_start_pct": soc_start_pct,
+            "soc_end_pct": soc_end_pct,
             "battery_action": r.battery_action,
             "battery_power_kw": round(bp_kw, 6),
             "grid_import_kwh": round(r.grid_import_kwh, 6),
@@ -1041,7 +1065,8 @@ def build_forecast_document(
             "planned_additional_load_kwh_next_24h": round(sum(float(s.get("additional_load_kwh", 0.0) or 0.0) for s in first_24_slots), 6),
         },
         "live_state": live_state,
-        "current_soc_pct": live_state.get("battery_soc"),
+        "current_soc_pct": live_state.get("battery_soc") if battery_available(cfg) else None,
+        "battery_mode": "enabled" if battery_available(cfg) else "disabled",
         "ev_charging_session": ev_charging_session or {},
         "active_requests": active_requests,
         "optimizer_slacks": {
@@ -1228,8 +1253,9 @@ def run_planner(
             f"missing_slots={coverage['missing_slots']}, first_missing={coverage['first_missing_slot']}",
             verbose=verbose,
         )
-    terminal_value = compute_terminal_value_czk_per_kwh(meta, cfg)
-    initial_soc = soc_pct_to_kwh(float(live_state["battery_soc"]), cfg)
+    effective_cfg = no_battery_config(cfg)
+    terminal_value = 0.0 if not battery_available(cfg) else compute_terminal_value_czk_per_kwh(meta, cfg)
+    initial_soc = 0.0 if not battery_available(cfg) else soc_pct_to_kwh(float(live_state["battery_soc"]), cfg)
 
     requests_list = load_active_requests(REQUESTS_PATH, tz)
     boiler_ledger = read_json(BOILER_CONTROL_STATE_PATH, {})
@@ -1239,10 +1265,11 @@ def run_planner(
         ev_session_state=ev_session_state,
     )
 
-    log(f"Optimalizuji {len(opt_slots)} slotů, SoC={live_state['battery_soc']} %, terminal={terminal_value:.4f} CZK/kWh", verbose=verbose)
+    soc_label = "disabled" if not battery_available(cfg) else f"{live_state['battery_soc']} %"
+    log(f"Optimalizuji {len(opt_slots)} slotů, battery={soc_label}, terminal={terminal_value:.4f} CZK/kWh", verbose=verbose)
     result = optimizer.optimize(
         opt_slots,
-        cfg,
+        effective_cfg,
         initial_soc_kwh=initial_soc,
         terminal_value_czk_per_kwh=terminal_value,
         ev_request=ev_req,
@@ -1325,7 +1352,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 3
 
-    if live_state.get("battery_soc") is None:
+    if battery_available(cfg) and live_state.get("battery_soc") is None:
         print("CHYBA: live_state neobsahuje battery_soc", file=sys.stderr)
         alerting.notify_once(
             "planner.inverter_soc_missing",

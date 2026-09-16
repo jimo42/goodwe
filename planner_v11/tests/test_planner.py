@@ -779,3 +779,83 @@ def test_closed_ev_shortfall_below_two_kwh_is_tolerated_not_replanned():
     ev_summary = next(item for item in summary if item.get("id") == "ev-user")
     assert ev_summary["closure_shortfall_tolerated"] is True
     assert ev_summary["actual_request_shortfall_kwh"] == 0.1
+
+def test_config_battery_enabled_defaults_true_and_can_be_disabled():
+    cfg = _cfg()
+    assert cfg.battery.enabled is True
+    disabled = _cfg({"battery": {"enabled": False}})
+    assert disabled.battery.enabled is False
+    effective = planner.no_battery_config(disabled)
+    assert effective.battery.enabled is False
+    assert effective.battery.capacity_kwh == 0.0
+    assert effective.battery.max_charge_kw == 0.0
+    assert effective.battery.max_discharge_kw == 0.0
+    assert planner.soc_pct_to_kwh(50.0, disabled) == 0.0
+
+
+def test_build_forecast_document_marks_disabled_battery_without_soc_percentages():
+    cfg = _cfg({"battery": {"enabled": False}})
+    now = datetime(2026, 7, 22, 12, 0)
+    meta = [planner.SlotPlanInput(
+        slot_start=now,
+        price_eur_mwh=50.0,
+        price_export_eur_mwh=50.0,
+        price_source="actual",
+        import_price_czk_kwh=1.0,
+        export_revenue_czk_kwh=0.5,
+        pv_estimate_kwh=1.0,
+        base_load_expected_kwh=0.2,
+        base_load_reserve_kwh=0.0,
+        base_load_source="profile",
+        pool_load_kwh=0.0,
+        pool_heat_pump_kwh=0.0,
+        additional_load_kwh=0.0,
+        export_allowed=True,
+        effective_import_nonpositive=False,
+        sun_pct=None,
+        cloudcover_pct=None,
+    )]
+    result = optimizer.OptimizerResult(status="optimal", slots=[optimizer.SlotResult(
+        slot_start=now,
+        pv_to_fixed_load_kwh=0.2,
+        pv_to_boiler_kwh=0.0,
+        pv_to_battery_kwh=0.0,
+        pv_to_grid_kwh=0.8,
+        pv_curtailed_kwh=0.0,
+        grid_to_fixed_load_kwh=0.0,
+        grid_to_boiler_kwh=0.0,
+        grid_to_battery_kwh=0.0,
+        battery_to_fixed_load_kwh=0.0,
+        battery_to_boiler_kwh=0.0,
+        battery_to_grid_kwh=0.0,
+        soc_start_kwh=0.0,
+        soc_end_kwh=0.0,
+        boiler_phase_on=(False, False, False),
+        ev_delivered_kwh=0.0,
+        grid_import_kwh=0.0,
+        grid_export_kwh=0.8,
+        battery_action=optimizer.ACTION_DISABLED,
+    )])
+
+    doc = planner.build_forecast_document(
+        generated_at=now,
+        valid_until=now + timedelta(minutes=30),
+        cfg=cfg,
+        live_state={"battery_soc": None},
+        meta=meta,
+        result=result,
+        active_requests=[],
+        terminal_value_czk_per_kwh=0.0,
+        additional_requests=[],
+        detected_loads={},
+        planner_duration_seconds=0.001,
+        boiler_budget_diagnostics={},
+    )
+
+    assert doc["battery_mode"] == "disabled"
+    assert doc["current_soc_pct"] is None
+    assert doc["slots"][0]["soc_start_pct"] is None
+    assert doc["slots"][0]["soc_end_pct"] is None
+    assert doc["slots"][0]["battery_action"] == "DISABLED"
+    assert doc["slots"][0]["battery_power_kw"] == 0.0
+

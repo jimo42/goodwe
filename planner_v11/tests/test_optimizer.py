@@ -443,3 +443,49 @@ def test_stage3_uses_dedicated_short_time_limit():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_no_battery_effective_config_zeroes_battery_flows_and_keeps_controls():
+    cfg = _cfg({"battery": {"enabled": False}})
+    # Optimizer receives the effective no-battery config from planner boundary.
+    import importlib.util
+    from pathlib import Path
+    planner_path = Path(__file__).resolve().parent.parent / "planner.py"
+    spec = importlib.util.spec_from_file_location("planner_v11_no_battery_optimizer_test", planner_path)
+    planner_mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = planner_mod
+    spec.loader.exec_module(planner_mod)
+    effective_cfg = planner_mod.no_battery_config(cfg)
+
+    slots = [
+        _slot(cfg, offset=0, pv_kwh=1.5, fixed_load_kwh=0.1, export_allowed=True),
+        _slot(cfg, offset=1, pv_kwh=0.0, fixed_load_kwh=0.1, export_allowed=True),
+    ]
+    ev_req = opt.EvRequest(window_start_idx=0, window_end_idx=1, required_ac_kwh=0.2, planning_power_kw=cfg.ev.planning_power_kw)
+    boiler_req = opt.BoilerHardRequest(deadline_idx=1, required_kwh=0.5)
+
+    result = opt.optimize(
+        slots,
+        effective_cfg,
+        initial_soc_kwh=0.0,
+        terminal_value_czk_per_kwh=0.0,
+        ev_request=ev_req,
+        boiler_hard_request=boiler_req,
+    )
+
+    assert result.status == "optimal"
+    assert result.ev_unserved_kwh < 1e-6
+    assert result.boiler_hard_unserved_kwh < 1e-6
+    assert sum(r.ev_delivered_kwh for r in result.slots) >= 0.2 - 1e-6
+    assert sum(r.pv_to_boiler_kwh + r.grid_to_boiler_kwh + r.battery_to_boiler_kwh for r in result.slots) >= 0.5 - 1e-6
+    assert sum(r.grid_export_kwh for r in result.slots) > 0.0
+    for slot in result.slots:
+        assert slot.battery_action == opt.ACTION_DISABLED
+        assert slot.pv_to_battery_kwh == 0
+        assert slot.grid_to_battery_kwh == 0
+        assert slot.battery_to_fixed_load_kwh == 0
+        assert slot.battery_to_boiler_kwh == 0
+        assert slot.battery_to_grid_kwh == 0
+        assert slot.soc_start_kwh == 0
+        assert slot.soc_end_kwh == 0

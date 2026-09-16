@@ -170,6 +170,7 @@ ACTION_HOLD = "HOLD"
 ACTION_FORCE_CHARGE = "FORCE_CHARGE"
 ACTION_DISCHARGE_TO_LOAD = "DISCHARGE_TO_LOAD"
 ACTION_DISCHARGE_TO_GRID = "DISCHARGE_TO_GRID"
+ACTION_DISABLED = "DISABLED"
 
 
 def _classify_battery_action(
@@ -184,6 +185,8 @@ def _classify_battery_action(
 ) -> str:
     """Odvodí popisný `battery_action` label pro daný slot z výsledných
     toků (jen pro vysvětlitelnost/`reason_codes` - NEOVLIVŇUJE MILP)."""
+    if min_soc_kwh == 0 and soc_kwh == 0 and grid_to_battery <= _EPS and battery_to_grid <= _EPS and battery_to_fixed_load <= _EPS and battery_to_boiler <= _EPS:
+        return ACTION_DISABLED
     if grid_to_battery > _EPS:
         return ACTION_FORCE_CHARGE
     if battery_to_grid > _EPS:

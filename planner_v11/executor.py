@@ -432,6 +432,8 @@ def decide_battery_execution(
     forecast_doc: Optional[dict], slot: Optional[dict], cfg: Config, forecast_valid: bool,
     now: datetime, eco_plan_state_path: Path = ECO_PLAN_STATE_PATH,
 ) -> dict:
+    if not getattr(cfg.battery, "enabled", True):
+        return {"status": "battery_disabled", "execute": False, "schedules": [], "reason": "battery.enabled=false"}
     planned = planned_battery_action(slot)
     if not forecast_valid or forecast_doc is None:
         return {**planned, "execute": False, "status": "blocked_failsafe_stale_or_invalid_plan"}
@@ -1005,6 +1007,8 @@ def _interpolated_expected_soc_pct(slot: dict, now: datetime, cfg: Config) -> fl
 
 
 def detect_plan_deviation(slot: Optional[dict], live_state: dict, cfg: Config, *, now: Optional[datetime] = None) -> tuple[bool, str]:
+    if not getattr(cfg.battery, "enabled", True):
+        return False, "BATTERY_DISABLED"
     if not slot:
         return False, "NO_CURRENT_SLOT"
     actual_soc = live_state.get("battery_soc")
@@ -1697,9 +1701,9 @@ def send_executor_alerts(
     return outcomes
 
 
-async def read_live_state_or_fail() -> dict:
+async def read_live_state_or_fail(cfg: Optional[Config] = None) -> dict:
     live = await planner_module.read_live_state()
-    if live.get("battery_soc") is None:
+    if (cfg is None or getattr(cfg.battery, "enabled", True)) and live.get("battery_soc") is None:
         raise RuntimeError("live_state neobsahuje battery_soc")
     return live
 
@@ -1753,7 +1757,9 @@ def run_executor(
         "status": "not_read_invalid_forecast", "zero_export_active": False,
     }
     battery_failure = update_device_failure_counter(
-        "battery_eco", battery_decision.get("status") not in ("eco_write_failed", "eco_write_verification_failed"), now=now,
+        "battery_eco",
+        True if battery_decision.get("status") == "battery_disabled" else battery_decision.get("status") not in ("eco_write_failed", "eco_write_verification_failed"),
+        now=now,
     )
     boiler_decision = decide_boiler_execution(
         current_slot,
@@ -1930,7 +1936,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         }
     else:
         try:
-            live_state = asyncio.run(read_live_state_or_fail())
+            live_state = asyncio.run(read_live_state_or_fail(cfg))
         except Exception as e:
             print(f"CHYBA: nelze přečíst live stav střídače: {e}", file=sys.stderr)
             failure = update_device_failure_counter("inverter", False, now=now)

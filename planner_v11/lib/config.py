@@ -87,6 +87,7 @@ class EconomicsConfig:
 
 @dataclass(frozen=True)
 class BatteryConfig:
+    enabled: bool
     capacity_kwh: float
     min_soc_pct: float
     max_soc_pv_pct: float
@@ -311,7 +312,13 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
 
     # --- battery ---
     v = _SectionValidator("battery", raw.get("battery"), errors)
+    battery_enabled = True
+    v._seen_keys.add("enabled")
+    if isinstance(v.data, dict) and "enabled" in v.data:
+        raw_battery_enabled = v.get("enabled", bool)
+        battery_enabled = True if raw_battery_enabled is None else bool(raw_battery_enabled)
     battery = BatteryConfig(
+        enabled=battery_enabled,
         capacity_kwh=v.get("capacity_kwh", (int, float), min_value=0.1) or 1.0,
         min_soc_pct=v.get("min_soc_pct", (int, float), min_value=0, max_value=100) or 0.0,
         max_soc_pv_pct=v.get("max_soc_pv_pct", (int, float), min_value=0, max_value=100) or 100.0,

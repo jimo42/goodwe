@@ -852,3 +852,18 @@ def test_failure_counter_alerts_only_after_third_consecutive_failure():
         shutil.rmtree(tmp, ignore_errors=True)
     assert [a["consecutive_failures"], b["consecutive_failures"], c["consecutive_failures"]] == [1, 2, 3]
     assert recovered["consecutive_failures"] == 0
+
+def test_battery_disabled_skips_eco_write_and_soc_deviation():
+    cfg = _cfg({"battery": {"enabled": False}, "system": {"dry_run": False, "battery_write_enabled": True}})
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    forecast = _forecast(cfg, now)
+    slot = forecast["slots"][0]
+
+    decision = executor.decide_battery_execution(forecast, slot, cfg, forecast_valid=True, now=now)
+    assert decision["status"] == "battery_disabled"
+    assert decision["execute"] is False
+    assert decision["schedules"] == []
+
+    detected, reason = executor.detect_plan_deviation({"soc_start_pct": 50.0}, {"battery_soc": None}, cfg, now=now)
+    assert detected is False
+    assert reason == "BATTERY_DISABLED"
