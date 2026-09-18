@@ -781,7 +781,11 @@ def test_closed_ev_shortfall_below_two_kwh_is_tolerated_not_replanned():
     assert ev_summary["actual_request_shortfall_kwh"] == 0.1
 
 def test_config_battery_enabled_defaults_true_and_can_be_disabled():
-    cfg = _cfg()
+    with open(CONFIG_PATH, "rb") as f:
+        raw = tomllib.load(f)
+    raw = copy.deepcopy(raw)
+    raw.get("battery", {}).pop("enabled", None)
+    cfg = parse_config_dict(raw)
     assert cfg.battery.enabled is True
     disabled = _cfg({"battery": {"enabled": False}})
     assert disabled.battery.enabled is False
@@ -792,6 +796,113 @@ def test_config_battery_enabled_defaults_true_and_can_be_disabled():
     assert effective.battery.max_discharge_kw == 0.0
     assert planner.soc_pct_to_kwh(50.0, disabled) == 0.0
 
+
+
+def test_choose_requests_with_disabled_battery_uses_effective_zero_battery_config():
+    cfg = _cfg({"system": {"horizon_hours": 2}, "battery": {"enabled": False}})
+    effective_cfg = planner.no_battery_config(cfg)
+    starts = [datetime(2026, 9, 17, 9, 0) + timedelta(minutes=15 * i) for i in range(8)]
+    opt_slots = [
+        optimizer.SlotInput(
+            slot_start=dt,
+            price_import_czk_kwh=3.0,
+            price_export_czk_kwh=0.5,
+            export_allowed=True,
+            effective_import_nonpositive=False,
+            pv_kwh=0.0,
+            fixed_load_kwh=0.1,
+        )
+        for dt in starts
+    ]
+    request = {
+        "id": "ev-no-battery",
+        "request_id": "ev-no-battery",
+        "type": "ev_charge",
+        "required_ac_kwh": 3.0,
+        "available_from": starts[0],
+        "deadline": starts[-1] + timedelta(minutes=15),
+    }
+
+    ev_req, _boiler_req, summary = planner.choose_requests(
+        [request],
+        starts,
+        effective_cfg,
+        opt_slots,
+        initial_soc_kwh=0.0,
+        terminal_value_czk_per_kwh=0.0,
+        ev_session_state={},
+    )
+
+    assert ev_req is not None
+    assert ev_req.required_ac_kwh == 3.0
+    ev_summary = next(item for item in summary if item.get("id") == "ev-no-battery")
+    rec = ev_summary["recommendation"]
+    assert rec["feasible"] is True
+    assert rec["expected_delivered_kwh"] == 3.0
+
+
+
+def test_active_ev_session_summary_prefers_current_user_request_for_forecast_correlation():
+    cfg = _cfg({"system": {"horizon_hours": 2}, "battery": {"enabled": False}})
+    effective_cfg = planner.no_battery_config(cfg)
+    starts = [datetime(2026, 9, 18, 11, 15) + timedelta(minutes=15 * i) for i in range(8)]
+    opt_slots = [
+        optimizer.SlotInput(
+            slot_start=dt,
+            price_import_czk_kwh=3.0,
+            price_export_czk_kwh=0.5,
+            export_allowed=True,
+            effective_import_nonpositive=False,
+            pv_kwh=0.0,
+            fixed_load_kwh=0.1,
+        )
+        for dt in starts
+    ]
+    current_request = {
+        "id": "new-ev",
+        "request_id": "new-ev",
+        "type": "ev_charge",
+        "required_ac_kwh": 9.0,
+        "requested_ac_kwh_original": 9.0,
+        "source": "whatsapp",
+        "available_from": starts[0],
+        "deadline": datetime(2026, 9, 19, 14, 0),
+    }
+    old_session = {
+        "state": "ACTIVE",
+        "request_id": "old-ev",
+        "session_id": "ev-old-session",
+        "request_source": "user",
+        "requested_ac_kwh_original": 3.0,
+        "effective_target_kwh": 3.0,
+        "delivered_kwh": 3.7,
+        "request_remaining_kwh": 0.0,
+        "physical_remaining_to_max_kwh": 5.3,
+        "current_power_w": None,
+    }
+
+    ev_req, _boiler_req, summary = planner.choose_requests(
+        [current_request],
+        starts,
+        effective_cfg,
+        opt_slots,
+        initial_soc_kwh=0.0,
+        terminal_value_czk_per_kwh=0.0,
+        ev_session_state=old_session,
+    )
+
+    assert ev_req is not None
+    assert ev_req.fixed_profile is True
+    ev_summary = next(item for item in summary if item.get("type") == "ev_charge")
+    assert ev_summary["id"] == "new-ev"
+    assert ev_summary["session_request_id"] == "old-ev"
+    assert ev_summary["deadline"] == "2026-09-19T14:00:00"
+    assert ev_summary["requested_ac_kwh_original"] == 9.0
+    assert ev_summary["required_ac_kwh"] == 9.0
+    rec = ev_summary["recommendation"]
+    assert rec["feasible"] is True
+    assert rec["recommended_start"] == starts[0].isoformat()
+    assert rec["expected_delivered_kwh"] == 5.3
 
 def test_build_forecast_document_marks_disabled_battery_without_soc_percentages():
     cfg = _cfg({"battery": {"enabled": False}})

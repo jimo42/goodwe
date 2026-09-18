@@ -614,18 +614,38 @@ def choose_requests(
             and str(ev_source_req.get("id") or ev_source_req.get("request_id") or "") == session_request_id
             else None
         )
-        summary_id = session_request_id
-        summary_source = session.get("request_source") or "synthetic"
-        deadline = matching_user.get("deadline") if matching_user else None
+        summary_user = ev_source_req if ev_source_req is not None else matching_user
+        summary_id = (
+            summary_user.get("id") or summary_user.get("request_id")
+            if isinstance(summary_user, dict)
+            else session_request_id
+        )
+        summary_source = (
+            summary_user.get("source")
+            if isinstance(summary_user, dict) and summary_user.get("source")
+            else session.get("request_source") or "synthetic"
+        )
+        deadline = summary_user.get("deadline") if isinstance(summary_user, dict) else None
+        requested_original = (
+            summary_user.get("requested_ac_kwh_original", summary_user.get("required_ac_kwh"))
+            if isinstance(summary_user, dict)
+            else session.get("requested_ac_kwh_original")
+        )
+        required_kwh = (
+            summary_user.get("required_ac_kwh")
+            if isinstance(summary_user, dict)
+            else session.get("effective_target_kwh")
+        )
         active_summary.append({
             "type": "ev_charge",
             "id": summary_id,
+            "session_request_id": session_request_id or None,
             "request_source": summary_source,
             "session_id": session.get("session_id"),
             "session_status": session_status,
             "window_locked": True,
-            "requested_ac_kwh_original": session.get("requested_ac_kwh_original"),
-            "required_ac_kwh": session.get("effective_target_kwh"),
+            "requested_ac_kwh_original": requested_original,
+            "required_ac_kwh": required_kwh,
             "delivered_kwh": session.get("delivered_kwh"),
             "request_remaining_kwh": session.get("request_remaining_kwh"),
             "planning_remaining_to_physical_max_kwh": round(planning_remaining, 3),
@@ -1261,7 +1281,7 @@ def run_planner(
     boiler_ledger = read_json(BOILER_CONTROL_STATE_PATH, {})
     boiler_daily_limits, boiler_budget_diagnostics = boiler_daily_budget(starts, cfg, now, boiler_ledger)
     ev_req, boiler_req, active_summary = choose_requests(
-        requests_list, starts, cfg, opt_slots, initial_soc, terminal_value, boiler_daily_limits,
+        requests_list, starts, effective_cfg, opt_slots, initial_soc, terminal_value, boiler_daily_limits,
         ev_session_state=ev_session_state,
     )
 

@@ -88,7 +88,7 @@ def test_safe_boiler_phases_by_headroom_limits_to_plan_and_current():
 
 
 def test_decisions_blocked_by_dry_run_write_gates():
-    cfg = _cfg({"system": {"dry_run": True, "battery_write_enabled": False, "boiler_write_enabled": False}})
+    cfg = _cfg({"system": {"dry_run": True, "battery_write_enabled": False, "boiler_write_enabled": False}, "battery": {"enabled": True}})
     now = datetime(2026, 7, 22, 15, 0, tzinfo=ZoneInfo(cfg.system.timezone))
     slot = _forecast(cfg, now)["slots"][0]
     live = {"battery_soc": 50.0, "igrid1": 5.0, "igrid2": 5.0, "igrid3": 5.0}
@@ -321,7 +321,7 @@ def test_send_executor_alerts_suppresses_soc_deviation_in_dry_run():
 
 
 def test_soc_deviation_threshold_and_direction():
-    cfg = _cfg()
+    cfg = _cfg({"battery": {"enabled": True}})
     assert cfg.alerts.soc_deviation_threshold_pct_points == 15.0
     slot = {"soc_start_pct": 50.0}
 
@@ -339,7 +339,7 @@ def test_soc_deviation_threshold_and_direction():
 
 
 def test_soc_deviation_interpolates_current_slot():
-    cfg = _cfg()
+    cfg = _cfg({"battery": {"enabled": True}})
     tz = ZoneInfo(cfg.system.timezone)
     now = datetime(2026, 8, 10, 10, 7, 30, tzinfo=tz)
     slot = {
