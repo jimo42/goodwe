@@ -136,6 +136,13 @@ def round_down_to_slot(dt: datetime, slot_minutes: int) -> datetime:
     return dt.replace(minute=minute, second=0, microsecond=0)
 
 
+def round_up_to_slot(dt: datetime, slot_minutes: int) -> datetime:
+    rounded_down = round_down_to_slot(dt, slot_minutes)
+    if rounded_down == dt.replace(second=0, microsecond=0):
+        return rounded_down
+    return rounded_down + timedelta(minutes=slot_minutes)
+
+
 def slot_starts(now: datetime, cfg: Config) -> list[datetime]:
     start = round_down_to_slot(now, cfg.system.planning_step_minutes)
     return [
@@ -540,6 +547,7 @@ def choose_requests(
     terminal_value_czk_per_kwh: float,
     boiler_daily_limits: Optional[dict] = None,
     ev_session_state: Optional[dict] = None,
+    now: Optional[datetime] = None,
 ) -> tuple[Optional[optimizer.EvRequest], Optional[optimizer.BoilerHardRequest], list[dict]]:
     """Vybere podporované aktivní požadavky a vrátí optimizer requesty + JSON summary."""
     active_summary: list[dict] = []
@@ -587,7 +595,20 @@ def choose_requests(
     session = ev_session_state if isinstance(ev_session_state, dict) else {}
     session_status = str(session.get("state") or "IDLE")
     session_request_id = str(session.get("request_id") or "")
-    if session_status in ev_session.ACTIVE_STATES and starts:
+    ev_source_req_id = (
+        str(ev_source_req.get("id") or ev_source_req.get("request_id") or "")
+        if isinstance(ev_source_req, dict)
+        else ""
+    )
+    session_matches_active_request = bool(
+        session_request_id and ev_source_req_id and session_request_id == ev_source_req_id
+    )
+    lock_session_window = (
+        session_status in ev_session.ACTIVE_STATES
+        and starts
+        and (ev_source_req is None or session_matches_active_request)
+    )
+    if lock_session_window:
         planning_remaining = max(0.0, min(
             ev_session.MAX_SESSION_KWH,
             float(session.get("physical_remaining_to_max_kwh", 0.0) or 0.0),
@@ -636,6 +657,12 @@ def choose_requests(
             if isinstance(summary_user, dict)
             else session.get("effective_target_kwh")
         )
+        display_start = starts[0]
+        if now is not None:
+            display_start = min(
+                starts[end_idx] + step,
+                max(starts[0], round_up_to_slot(now, cfg.system.planning_step_minutes)),
+            )
         active_summary.append({
             "type": "ev_charge",
             "id": summary_id,
@@ -652,8 +679,8 @@ def choose_requests(
             "deadline": deadline.isoformat() if isinstance(deadline, datetime) else None,
             "recommendation": {
                 "feasible": True,
-                "recommended_start": starts[0].isoformat(),
-                "latest_safe_start": starts[0].isoformat(),
+                "recommended_start": display_start.isoformat(),
+                "latest_safe_start": display_start.isoformat(),
                 "expected_end": (starts[end_idx] + step).isoformat(),
                 "expected_delivered_kwh": round(planning_remaining, 3),
                 "reason": "Probíhající fyzická relace je zamknutá od aktuálního slotu do maxima 9 kWh.",
@@ -799,7 +826,7 @@ def choose_requests(
                         # ale forecast summary necháme zapsat a optimizer poběží
                         # bez EV hard požadavku místo pádu celého planneru.
                         ev_req = None
-                active_summary.append({
+                ev_summary = {
                     "type": rtype,
                     "id": req.get("id") or req.get("request_id"),
                     "requested_ac_kwh_original": original_required,
@@ -816,7 +843,20 @@ def choose_requests(
                         "expected_delivered_kwh": expected_delivered,
                         "reason": chosen_reason,
                     },
-                })
+                }
+                if (
+                    session_status in ev_session.ACTIVE_STATES
+                    and session_request_id
+                    and str(req.get("id") or req.get("request_id") or "") != session_request_id
+                ):
+                    ev_summary["ignored_session_request_id"] = session_request_id
+                    ev_summary["ignored_session_id"] = session.get("session_id")
+                    ev_summary["ignored_session_status"] = session_status
+                    ev_summary["ignored_session_reason"] = (
+                        "Active EV session belongs to a different request; the new request "
+                        "is planned economically as a separate request."
+                    )
+                active_summary.append(ev_summary)
 
     return ev_req, boiler_req, active_summary
 
@@ -1283,6 +1323,7 @@ def run_planner(
     ev_req, boiler_req, active_summary = choose_requests(
         requests_list, starts, effective_cfg, opt_slots, initial_soc, terminal_value, boiler_daily_limits,
         ev_session_state=ev_session_state,
+        now=now,
     )
 
     soc_label = "disabled" if not battery_available(cfg) else f"{live_state['battery_soc']} %"

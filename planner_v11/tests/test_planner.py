@@ -842,21 +842,69 @@ def test_choose_requests_with_disabled_battery_uses_effective_zero_battery_confi
 
 
 
-def test_active_ev_session_summary_prefers_current_user_request_for_forecast_correlation():
+
+
+def test_active_ev_session_user_facing_start_is_not_in_past():
     cfg = _cfg({"system": {"horizon_hours": 2}, "battery": {"enabled": False}})
     effective_cfg = planner.no_battery_config(cfg)
-    starts = [datetime(2026, 9, 18, 11, 15) + timedelta(minutes=15 * i) for i in range(8)]
+    starts = [datetime(2026, 9, 18, 13, 15) + timedelta(minutes=15 * i) for i in range(8)]
+    opt_slots = [optimizer.SlotInput(dt, 3.0, 0.5, True, False, 0.0, 0.1) for dt in starts]
+    session = {
+        "state": "ACTIVE",
+        "request_id": "same-ev",
+        "session_id": "ev-same-session",
+        "request_source": "whatsapp",
+        "requested_ac_kwh_original": 9.0,
+        "effective_target_kwh": 9.0,
+        "delivered_kwh": 3.7,
+        "request_remaining_kwh": 5.3,
+        "physical_remaining_to_max_kwh": 5.3,
+        "current_power_w": None,
+    }
+    current_request = {
+        "id": "same-ev",
+        "request_id": "same-ev",
+        "type": "ev_charge",
+        "required_ac_kwh": 9.0,
+        "requested_ac_kwh_original": 9.0,
+        "source": "whatsapp",
+        "available_from": starts[0],
+        "deadline": datetime(2026, 9, 19, 14, 0),
+    }
+
+    ev_req, _boiler_req, summary = planner.choose_requests(
+        [current_request],
+        starts,
+        effective_cfg,
+        opt_slots,
+        0.0,
+        0.0,
+        ev_session_state=session,
+        now=datetime(2026, 9, 18, 13, 29, 2),
+    )
+
+    assert ev_req is not None
+    assert ev_req.window_start_idx == 0
+    ev_summary = next(item for item in summary if item.get("type") == "ev_charge")
+    rec = ev_summary["recommendation"]
+    assert rec["recommended_start"] == datetime(2026, 9, 18, 13, 30).isoformat()
+    assert rec["latest_safe_start"] == datetime(2026, 9, 18, 13, 30).isoformat()
+
+def test_active_ev_session_does_not_lock_different_new_user_request():
+    cfg = _cfg({"system": {"horizon_hours": 24}, "battery": {"enabled": False}})
+    effective_cfg = planner.no_battery_config(cfg)
+    starts = [datetime(2026, 9, 18, 11, 15) + timedelta(minutes=15 * i) for i in range(96)]
     opt_slots = [
         optimizer.SlotInput(
             slot_start=dt,
-            price_import_czk_kwh=3.0,
+            price_import_czk_kwh=1.0 if 16 <= i < 29 else 10.0,
             price_export_czk_kwh=0.5,
             export_allowed=True,
             effective_import_nonpositive=False,
             pv_kwh=0.0,
             fixed_load_kwh=0.1,
         )
-        for dt in starts
+        for i, dt in enumerate(starts)
     ]
     current_request = {
         "id": "new-ev",
@@ -866,7 +914,7 @@ def test_active_ev_session_summary_prefers_current_user_request_for_forecast_cor
         "requested_ac_kwh_original": 9.0,
         "source": "whatsapp",
         "available_from": starts[0],
-        "deadline": datetime(2026, 9, 19, 14, 0),
+        "deadline": starts[-1] + timedelta(minutes=15),
     }
     old_session = {
         "state": "ACTIVE",
@@ -892,13 +940,58 @@ def test_active_ev_session_summary_prefers_current_user_request_for_forecast_cor
     )
 
     assert ev_req is not None
-    assert ev_req.fixed_profile is True
+    assert ev_req.fixed_profile is False
     ev_summary = next(item for item in summary if item.get("type") == "ev_charge")
     assert ev_summary["id"] == "new-ev"
-    assert ev_summary["session_request_id"] == "old-ev"
-    assert ev_summary["deadline"] == "2026-09-19T14:00:00"
+    assert ev_summary["deadline"] == "2026-09-19T11:15:00"
     assert ev_summary["requested_ac_kwh_original"] == 9.0
     assert ev_summary["required_ac_kwh"] == 9.0
+    rec = ev_summary["recommendation"]
+    assert rec["feasible"] is True
+    assert rec["recommended_start"] != starts[0].isoformat()
+    assert starts[12].isoformat() <= rec["recommended_start"] <= starts[20].isoformat()
+    assert rec["expected_delivered_kwh"] == 9.0
+
+
+
+def test_active_ev_session_locks_matching_request_for_forecast_correlation():
+    cfg = _cfg({"system": {"horizon_hours": 2}, "battery": {"enabled": False}})
+    effective_cfg = planner.no_battery_config(cfg)
+    starts = [datetime(2026, 9, 18, 11, 15) + timedelta(minutes=15 * i) for i in range(8)]
+    opt_slots = [optimizer.SlotInput(dt, 3.0, 0.5, True, False, 0.0, 0.1) for dt in starts]
+    current_request = {
+        "id": "same-ev",
+        "request_id": "same-ev",
+        "type": "ev_charge",
+        "required_ac_kwh": 9.0,
+        "requested_ac_kwh_original": 9.0,
+        "source": "whatsapp",
+        "available_from": starts[0],
+        "deadline": datetime(2026, 9, 19, 14, 0),
+    }
+    session = {
+        "state": "ACTIVE",
+        "request_id": "same-ev",
+        "session_id": "ev-same-session",
+        "request_source": "whatsapp",
+        "requested_ac_kwh_original": 9.0,
+        "effective_target_kwh": 9.0,
+        "delivered_kwh": 3.7,
+        "request_remaining_kwh": 5.3,
+        "physical_remaining_to_max_kwh": 5.3,
+        "current_power_w": None,
+    }
+
+    ev_req, _boiler_req, summary = planner.choose_requests(
+        [current_request], starts, effective_cfg, opt_slots, 0.0, 0.0, ev_session_state=session
+    )
+
+    assert ev_req is not None
+    assert ev_req.fixed_profile is True
+    ev_summary = next(item for item in summary if item.get("type") == "ev_charge")
+    assert ev_summary["id"] == "same-ev"
+    assert ev_summary["session_request_id"] == "same-ev"
+    assert ev_summary["deadline"] == "2026-09-19T14:00:00"
     rec = ev_summary["recommendation"]
     assert rec["feasible"] is True
     assert rec["recommended_start"] == starts[0].isoformat()
