@@ -472,7 +472,9 @@ def optimize(
 
     # ========================================================================
     # STAGE 3: fixovat stage 2 s tolerancí, minimalizovat bateriový
-    # throughput (částečná úroveň 3 - viz docstring modulu)
+    # throughput.  Poté při stejném minimálním throughputu znovu minimalizovat
+    # ekonomiku, aby tolerance nemohla zahodit levné/negativní boiler okno jen
+    # proto, že má stejný bateriový throughput jako nečinnost.
     # ========================================================================
     tie_tolerance = cfg.solver.economic_tie_tolerance_czk
     prob += (
@@ -487,7 +489,21 @@ def optimize(
         prob, cfg.solver.tie_break_time_limit_seconds, cfg.solver.mip_gap
     )
     if result3.is_optimal:
-        final_status = result3.status
+        stage3_throughput = pulp.value(throughput_objective)
+        stage3_solution = _snapshot_variable_values(prob)
+        prob += (
+            throughput_objective <= stage3_throughput + _EPS,
+            "stage3_throughput_fix",
+        )
+        prob.objective = economic_objective
+        result4 = solver_adapter.solve(
+            prob, cfg.solver.tie_break_time_limit_seconds, cfg.solver.mip_gap
+        )
+        if result4.is_optimal:
+            final_status = result4.status
+        else:
+            _restore_variable_values(stage3_solution)
+            final_status = result3.status
     else:
         # A time-limited/failed stage 3 mutates PuLP variable values even
         # though stage 2 remains the last certified optimum. Restore the full

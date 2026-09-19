@@ -428,14 +428,6 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
     )
     for k in v.unknown_keys():
         errors.append(f"[boiler.{k}] neznámý klíč")
-    if not errors_contain(errors, "boiler."):
-        # A rollback is only allowed after the added phase has completed its
-        # normal minimum-on dwell time.
-        if boiler.curtailment_probe_observe_minutes < boiler.minimum_on_minutes:
-            errors.append(
-                "[boiler] curtailment_probe_observe_minutes musí být >= minimum_on_minutes"
-            )
-
     # --- alerts ---
     v = _SectionValidator("alerts", raw.get("alerts"), errors)
     alerts = AlertsConfig(

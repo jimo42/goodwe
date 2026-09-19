@@ -570,9 +570,54 @@ def _probe_one_additional_mask(
     }
 
 
+def probe_mask_economics(
+    *, target_mask: tuple[bool, bool, bool], slot: Optional[dict], forecast_doc: Optional[dict],
+    now: datetime, cfg: Config, telemetry_evidence: dict, observed_grid_kw: Optional[float] = None,
+) -> dict:
+    target_kw = sum(1 for value in target_mask if value) * cfg.boiler.phase_power_kw
+    gas_value = economics.gas_heat_value_czk_per_kwh(cfg)
+    price_available = slot is not None and (slot or {}).get("price_eur_mwh") is not None
+    spot = float((slot or {}).get("price_eur_mwh", 0.0) or 0.0)
+    import_cost = economics.import_cost_czk_per_kwh(spot, cfg)
+    export_opportunity = economics.export_revenue_czk_per_kwh(spot, cfg)
+    pre_surplus = max(0.0, float(telemetry_evidence.get("reconstructed_pre_boiler_surplus_kw", 0.0) or 0.0))
+    if observed_grid_kw is None:
+        surplus_kw = min(target_kw, pre_surplus)
+        import_kw = max(0.0, target_kw - surplus_kw)
+        basis = "reconstructed_pre_boiler_surplus"
+    else:
+        # During an active zero-export probe, current PV output can be curtailed and
+        # therefore is not a reliable measure of true irradiance.  Net grid import
+        # after adding the boiler is the best direct evidence of how much of the
+        # delivered boiler power is actually bought from the grid; the remainder is
+        # valued as released PV/export opportunity.
+        import_kw = min(target_kw, max(0.0, -float(observed_grid_kw)))
+        surplus_kw = max(0.0, target_kw - import_kw)
+        basis = "observed_grid_import"
+    mixed_cost = 0.0 if target_kw == 0 else (surplus_kw * export_opportunity + import_kw * import_cost) / target_kw
+    future = best_future_solar_opportunity_today(forecast_doc, now, cfg)
+    future_cost = future.get("opportunity_cost_czk_kwh") if future else None
+    future_better = import_kw > 0 and future_cost is not None and future_cost + 1e-9 < import_cost
+    return {
+        "target_kw": round(target_kw, 6),
+        "surplus_covered_kw": round(surplus_kw, 6),
+        "import_covered_kw": round(import_kw, 6),
+        "mixed_cost_czk_kwh": round(mixed_cost, 6),
+        "gas_heat_value_czk_kwh": round(gas_value, 6),
+        "import_cost_czk_kwh": round(import_cost, 6),
+        "export_opportunity_czk_kwh": round(export_opportunity, 6),
+        "best_future_solar_opportunity_today": future,
+        "future_solar_better_for_import": future_better,
+        "evaluation_basis": basis,
+        "economic_available": price_available,
+        "economic": price_available and (target_kw == 0 or (mixed_cost < gas_value and not future_better)),
+    }
+
+
 def curtailment_probe_transition(
     *, current_mask: tuple[bool, bool, bool], requested_phases: int, hard_active: bool,
     live_state: dict, telemetry_evidence: dict, ledger: dict, export_limit_state: dict,
+    slot: Optional[dict], forecast_doc: Optional[dict],
     now: datetime, cfg: Config,
 ) -> Optional[dict]:
     """Return a bounded zero-export probe action, or ``None`` for normal control.
@@ -609,16 +654,25 @@ def curtailment_probe_transition(
             and float(delivery[added[0]] or 0.0) >= 1.0
         )
         pv_response = None if pv_kw is None or pv2_kw is None or baseline_pv is None else pv_kw + pv2_kw - float(baseline_pv)
+        economics_evidence = probe_mask_economics(
+            target_mask=probed_mask, slot=slot, forecast_doc=forecast_doc, now=now, cfg=cfg,
+            telemetry_evidence=telemetry_evidence, observed_grid_kw=grid_kw,
+        )
         accepted = (
             _probe_fresh(telemetry_evidence, cfg)
-            and grid_kw is not None and grid_kw >= -cfg.boiler.curtailment_probe_import_tolerance_kw
             and battery_kw is not None and battery_kw <= cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw
             and pv_response is not None and pv_response >= cfg.boiler.curtailment_probe_min_pv_response_kw
             and delivered
+            and (
+                economics_evidence["economic"]
+                if economics_evidence.get("economic_available")
+                else grid_kw is not None and grid_kw >= -cfg.boiler.curtailment_probe_import_tolerance_kw
+            )
         )
         evidence = {
             "grid_kw": grid_kw, "battery_kw": battery_kw, "pv_response_kw": pv_response,
             "added_phase_delivery_confirmed": delivered, "telemetry_fresh": _probe_fresh(telemetry_evidence, cfg),
+            "price_economics": economics_evidence,
         }
         return {
             "kind": "accept" if accepted else "rollback",
@@ -647,23 +701,37 @@ def curtailment_probe_transition(
             "kind": "blocked", "reason": f"BOILER_EXPORT_CURTAILMENT_PROBE_{unavailable[0]}_UNAVAILABLE",
             "evidence": {"unavailable": unavailable},
         }
-    if grid_kw < -cfg.boiler.curtailment_probe_import_tolerance_kw:
-        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORTING", "evidence": {"grid_kw": grid_kw}}
+    trial_target, trial_phase_evidence = _probe_one_additional_mask(
+        current_mask=current_mask, live_state=live_state, ledger=ledger, now=now, cfg=cfg,
+    )
+    if trial_target is None:
+        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_NO_SAFE_PHASE", "evidence": trial_phase_evidence}
+    trial_economics = probe_mask_economics(
+        target_mask=trial_target, slot=slot, forecast_doc=forecast_doc, now=now, cfg=cfg,
+        telemetry_evidence=telemetry_evidence,
+    )
+    if grid_kw < -cfg.boiler.curtailment_probe_import_tolerance_kw and not trial_economics["economic"]:
+        return {
+            "kind": "blocked",
+            "reason": (
+                "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORT_PRICE_TOO_HIGH"
+                if trial_economics.get("economic_available")
+                else "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORTING"
+            ),
+            "evidence": {"grid_kw": grid_kw, "price_economics": trial_economics},
+        }
     if battery_kw > cfg.boiler.curtailment_probe_battery_discharge_tolerance_kw:
         return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_BATTERY_DISCHARGING", "evidence": {"battery_kw": battery_kw}}
     if pv1_kw + pv2_kw < cfg.boiler.curtailment_probe_min_pv_response_kw:
         return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_PV_TOO_LOW", "evidence": {"pv_kw": pv1_kw + pv2_kw}}
-    target_mask, phase_evidence = _probe_one_additional_mask(
-        current_mask=current_mask, live_state=live_state, ledger=ledger, now=now, cfg=cfg,
-    )
-    if target_mask is None:
-        return {"kind": "blocked", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_NO_SAFE_PHASE", "evidence": phase_evidence}
+    target_mask, phase_evidence = trial_target, trial_phase_evidence
     return {
         "kind": "start", "target_mask": target_mask,
         "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_STARTED",
         "evidence": {
             **phase_evidence, "baseline_grid_kw": grid_kw, "baseline_battery_kw": battery_kw,
             "baseline_pv_kw": round(pv1_kw + pv2_kw, 6), "export_limit": export_limit_state,
+            "price_economics": trial_economics,
         },
     }
 
@@ -947,6 +1015,8 @@ def decide_boiler_execution(
         telemetry_evidence=telemetry_evidence,
         ledger=ledger,
         export_limit_state=export_limit_state or {"status": "not_read", "zero_export_active": False},
+        slot=slot,
+        forecast_doc=forecast_doc,
         now=now,
         cfg=cfg,
     )

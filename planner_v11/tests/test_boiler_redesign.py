@@ -270,7 +270,7 @@ def test_curtailment_probe_starts_exactly_one_safe_phase_only_after_zero_export_
     transition = executor.curtailment_probe_transition(
         current_mask=(False, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
-        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), now=now, cfg=cfg,
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert transition["kind"] == "start"
     assert sum(transition["target_mask"]) == 1
@@ -278,7 +278,7 @@ def test_curtailment_probe_starts_exactly_one_safe_phase_only_after_zero_export_
     assert executor.curtailment_probe_transition(
         current_mask=(False, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
-        ledger=boiler_state.empty_state(), export_limit_state={"zero_export_active": False}, now=now, cfg=cfg,
+        ledger=boiler_state.empty_state(), export_limit_state={"zero_export_active": False}, slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     ) is None
 
 
@@ -288,10 +288,61 @@ def test_curtailment_probe_does_not_compete_with_normal_growth_or_hard_request()
     kwargs = {
         "current_mask": (False, False, False), "live_state": _probe_live(),
         "telemetry_evidence": _probe_telemetry(), "ledger": boiler_state.empty_state(),
-        "export_limit_state": _zero_export(), "now": now, "cfg": cfg,
+        "export_limit_state": _zero_export(), "slot": {"price_eur_mwh": -20.0}, "forecast_doc": {"slots": []}, "now": now, "cfg": cfg,
     }
     assert executor.curtailment_probe_transition(requested_phases=1, hard_active=False, **kwargs) is None
     assert executor.curtailment_probe_transition(requested_phases=0, hard_active=True, **kwargs) is None
+
+
+def test_curtailment_probe_falls_back_to_import_tolerance_without_price():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 5, tzinfo=ZoneInfo(cfg.system.timezone))
+    state = boiler_state.empty_state()
+    state["curtailment_probe"].update({
+        "status": "observing", "observe_after": now.isoformat(),
+        "previous_mask": [False, False, False], "probed_mask": [True, False, False], "baseline_pv_kw": 2.0,
+    })
+
+    rolled_back = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), slot=None, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert rolled_back["kind"] == "rollback"
+    assert rolled_back["evidence"]["price_economics"]["economic_available"] is False
+
+    blocked = executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(grid_kw=-0.8), telemetry_evidence=_probe_telemetry(),
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(),
+        slot=None, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert blocked["kind"] == "blocked"
+    assert blocked["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORTING"
+
+
+def test_curtailment_probe_start_allows_economic_import_but_blocks_expensive_import():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 14, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    cheap = executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(grid_kw=-0.8), telemetry_evidence=_probe_telemetry(),
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(),
+        slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert cheap["kind"] == "start"
+    assert cheap["evidence"]["price_economics"]["economic"] is True
+    assert cheap["evidence"]["price_economics"]["import_covered_kw"] > 0.0
+
+    expensive = executor.curtailment_probe_transition(
+        current_mask=(False, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(grid_kw=-0.8), telemetry_evidence=_probe_telemetry(),
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(),
+        slot={"price_eur_mwh": 50.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert expensive["kind"] == "blocked"
+    assert expensive["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_IMPORT_PRICE_TOO_HIGH"
+    assert expensive["evidence"]["price_economics"]["economic"] is False
 
 
 def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_import_or_discharge():
@@ -305,19 +356,28 @@ def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_impor
     accepted = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(pv_kw=4.0), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
-        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert accepted["kind"] == "accept"
-    imported = executor.curtailment_probe_transition(
+    cheap_imported = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
-        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.2), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
-        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
-    assert imported["kind"] == "rollback"
+    assert cheap_imported["kind"] == "accept"
+    assert cheap_imported["evidence"]["price_economics"]["economic"] is True
+
+    expensive_imported = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": 200.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert expensive_imported["kind"] == "rollback"
+    assert expensive_imported["evidence"]["price_economics"]["economic"] is False
     discharged = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(pv_kw=4.0, battery_kw=0.2), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
-        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert discharged["kind"] == "rollback"
 
@@ -328,7 +388,7 @@ def test_curtailment_probe_blocks_stale_data_and_cancels_when_relay_mask_changes
     blocked = executor.curtailment_probe_transition(
         current_mask=(False, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(), telemetry_evidence=_probe_telemetry(fresh=False),
-        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), now=now, cfg=cfg,
+        ledger=boiler_state.empty_state(), export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert blocked["kind"] == "blocked"
     assert blocked["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_TELEMETRY_STALE"
@@ -340,7 +400,7 @@ def test_curtailment_probe_blocks_stale_data_and_cancels_when_relay_mask_changes
     changed = executor.curtailment_probe_transition(
         current_mask=(False, False, False), requested_phases=0, hard_active=False,
         live_state=_probe_live(), telemetry_evidence=_probe_telemetry(),
-        ledger=state, export_limit_state=_zero_export(), now=now, cfg=cfg,
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert changed["kind"] == "cancel"
     assert changed["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_RELAY_MASK_CHANGED"
@@ -370,13 +430,10 @@ def test_curtailment_probe_persists_only_after_verified_relay_target_and_sets_co
     assert rolled_back["curtailment_probe"]["cooldown_until"] is not None
 
 
-def test_curtailment_probe_observe_must_not_undercut_minimum_on_time():
+def test_curtailment_probe_observe_can_be_shorter_than_minimum_on_time():
     with open(CONFIG_PATH, "rb") as handle:
         raw = copy.deepcopy(tomllib.load(handle))
-    raw["boiler"]["curtailment_probe_observe_minutes"] = 4
-    try:
-        parse_config_dict(raw)
-    except ConfigError as exc:
-        assert "curtailment_probe_observe_minutes musí být >= minimum_on_minutes" in str(exc)
-    else:
-        raise AssertionError("invalid probe observe duration was accepted")
+    raw["boiler"]["curtailment_probe_observe_minutes"] = 1
+    cfg = parse_config_dict(raw)
+    assert cfg.boiler.curtailment_probe_observe_minutes == 1
+    assert cfg.boiler.curtailment_probe_observe_minutes < cfg.boiler.minimum_on_minutes

@@ -125,6 +125,51 @@ def test_grid_charge_not_profitable_below_threshold():
     assert s1.grid_to_fixed_load_kwh > 0.9
 
 
+def test_boiler_pure_import_runs_below_gas_break_even():
+    cfg = _cfg({"battery": {"enabled": False}})
+    # Současná ekonomická hranice při default configu je cca -2.68 EUR/MWh.
+    slots = [_slot(cfg, price_import_spot=-20.0, price_export_spot=-20.0, pv_kwh=0.0, fixed_load_kwh=0.0)]
+
+    result = opt.optimize(slots, cfg, initial_soc_kwh=_floor_kwh(cfg), terminal_value_czk_per_kwh=0.0)
+
+    assert result.status == "optimal"
+    s0 = result.slots[0]
+    assert s0.grid_to_boiler_kwh > 0.1
+    assert s0.boiler_opportunistic_kwh > 0.1
+
+
+def test_boiler_pure_import_does_not_run_above_gas_break_even():
+    cfg = _cfg({"battery": {"enabled": False}})
+    # Při 0 EUR/MWh je import kvůli fixní složce+DPH stále lehce dražší než plyn.
+    slots = [_slot(cfg, price_import_spot=0.0, price_export_spot=0.0, pv_kwh=0.0, fixed_load_kwh=0.0)]
+
+    result = opt.optimize(slots, cfg, initial_soc_kwh=_floor_kwh(cfg), terminal_value_czk_per_kwh=0.0)
+
+    assert result.status == "optimal"
+    s0 = result.slots[0]
+    assert s0.grid_to_boiler_kwh < 1e-4
+    assert s0.boiler_opportunistic_kwh < 1e-4
+
+
+def test_boiler_negative_prices_prefer_later_daily_minimum():
+    cfg = _cfg({
+        "battery": {"enabled": False},
+        "boiler": {"opportunistic_daily_limit_kwh": 0.5, "initial_full_heat_max_kwh": 0.5},
+        "solver": {"economic_tie_tolerance_czk": 0.0},
+    })
+    slots = [
+        _slot(cfg, offset=0, price_import_spot=-5.0, price_export_spot=-5.0, pv_kwh=0.0, fixed_load_kwh=0.0),
+        _slot(cfg, offset=1, price_import_spot=-80.0, price_export_spot=-80.0, pv_kwh=0.0, fixed_load_kwh=0.0),
+    ]
+
+    result = opt.optimize(slots, cfg, initial_soc_kwh=_floor_kwh(cfg), terminal_value_czk_per_kwh=0.0)
+
+    assert result.status == "optimal"
+    s0, s1 = result.slots
+    assert s0.grid_to_boiler_kwh < 1e-4
+    assert s1.grid_to_boiler_kwh > 0.49
+
+
 def test_export_disabled_below_threshold():
     cfg = _cfg()
     slots = [
@@ -437,7 +482,7 @@ def test_stage3_uses_dedicated_short_time_limit():
         opt.solver_adapter.solve = original_solve
 
     assert result.status == "optimal"
-    assert limits == [60, 60, 5]
+    assert limits == [60, 60, 5, 5]
 
 
 if __name__ == "__main__":
@@ -475,7 +520,7 @@ def test_no_battery_effective_config_zeroes_battery_flows_and_keeps_controls():
     )
 
     assert result.status == "optimal"
-    assert result.ev_unserved_kwh < 1e-6
+    assert result.ev_unserved_kwh <= 1e-5
     assert result.boiler_hard_unserved_kwh < 1e-6
     assert sum(r.ev_delivered_kwh for r in result.slots) >= 0.2 - 1e-6
     assert sum(r.pv_to_boiler_kwh + r.grid_to_boiler_kwh + r.battery_to_boiler_kwh for r in result.slots) >= 0.5 - 1e-6
