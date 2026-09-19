@@ -86,6 +86,7 @@ DETECTED_LOADS_PATH = STATE_DIR / "detected_loads.json"
 ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
 BOILER_CONTROL_STATE_PATH = STATE_DIR / "boiler_control_state.json"
 EV_SESSION_STATE_PATH = STATE_DIR / "ev_session_state.json"
+EV_REPLAN_SKIP_COMPLETION_FRACTION = 2.0 / 3.0
 
 GOODWE_LIB_DIR = os.path.join(paths.BASE_DIR, "goodwe", "goodwe")
 GOODWE_CONF_PATH = os.path.join(paths.BASE_DIR, "conf", "goodwe.conf")
@@ -695,16 +696,22 @@ def choose_requests(
         try:
             original_required = float(req.get("requested_ac_kwh_original", req["required_ac_kwh"]))
             effective_target = min(ev_session.MAX_SESSION_KWH, max(0.0, float(req["required_ac_kwh"])))
+            req_id = str(req.get("id") or req.get("request_id") or "")
             delivered = 0.0
-            if session_status == "CLOSED" and session_request_id == str(req.get("id") or req.get("request_id") or ""):
+            if session_request_id == req_id or session_status in ev_session.ACTIVE_STATES:
                 delivered = max(0.0, float(session.get("delivered_kwh", 0.0) or 0.0))
             raw_remaining = round(max(0.0, effective_target - delivered), 3)
+            mostly_completed_by_active_session = (
+                session_status in ev_session.ACTIVE_STATES
+                and effective_target > 0.0
+                and delivered > effective_target * EV_REPLAN_SKIP_COMPLETION_FRACTION
+            )
             closure_tolerated = (
                 session_status == "CLOSED"
-                and session_request_id == str(req.get("id") or req.get("request_id") or "")
+                and session_request_id == req_id
                 and raw_remaining < ev_session.REPLAN_DEVIATION_KWH
             )
-            required = 0.0 if closure_tolerated else raw_remaining
+            required = 0.0 if closure_tolerated or mostly_completed_by_active_session else raw_remaining
             deadline = req["deadline"]
             available_from = req.get("available_from") or starts[0]
         except (KeyError, TypeError, ValueError):
@@ -713,23 +720,33 @@ def choose_requests(
             if not isinstance(deadline, datetime) or not isinstance(available_from, datetime):
                 active_summary.append({"type": rtype, "status": "invalid_datetime"})
             elif required <= 1e-6:
+                completion_reason = "Požadovaný cíl již byl v uzavřené relaci dosažen."
+                if mostly_completed_by_active_session:
+                    completion_reason = (
+                        "Probíhající fyzické nabíjení už pokrylo více než dvě třetiny "
+                        "požadavku; nové ekonomické okno se proto neplánuje."
+                    )
                 active_summary.append({
                     "type": rtype,
                     "id": req.get("id") or req.get("request_id"),
                     "requested_ac_kwh_original": original_required,
                     "required_ac_kwh": effective_target,
-                    "delivered_kwh": delivered,
-                    "request_remaining_kwh": 0.0,
+                    "delivered_kwh": round(delivered, 3),
+                    "request_remaining_kwh": 0.0 if closure_tolerated else raw_remaining,
                     "actual_request_shortfall_kwh": raw_remaining,
                     "closure_shortfall_tolerated": closure_tolerated,
+                    "mostly_completed_by_active_session": mostly_completed_by_active_session,
+                    "window_locked": bool(mostly_completed_by_active_session),
+                    "session_request_id": session_request_id or None,
+                    "session_id": session.get("session_id"),
                     "session_status": session_status if session_request_id else None,
                     "recommendation": {
                         "feasible": True,
                         "recommended_start": None,
                         "latest_safe_start": None,
                         "expected_end": None,
-                        "expected_delivered_kwh": 0.0,
-                        "reason": "Požadovaný cíl již byl v uzavřené relaci dosažen.",
+                        "expected_delivered_kwh": round(delivered, 3) if mostly_completed_by_active_session else 0.0,
+                        "reason": completion_reason,
                     },
                 })
             else:
@@ -1153,6 +1170,72 @@ def _format_ev_alert_interval(start: datetime, end: datetime) -> str:
     return f"{start.day}. {start.month}. {start.year} {start:%H:%M} až {end.day}. {end.month}. {end.year} {end:%H:%M}"
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ev_physical_completion_kwh(
+    *,
+    ev_session_state_path: Path = EV_SESSION_STATE_PATH,
+    detected_loads_path: Path = DETECTED_LOADS_PATH,
+) -> float:
+    """Best-effort physical EV energy already observed in the current wallbox session."""
+
+    candidates: list[float] = []
+    session_state = _read_json_object(ev_session_state_path)
+    session_name = str(session_state.get("state") or "").upper()
+    if session_name in ev_session.ACTIVE_STATES:
+        for key in ("delivered_kwh", "request_credited_kwh", "wallbox_counter_last_kwh"):
+            value = _float_or_none(session_state.get(key))
+            if value is not None:
+                candidates.append(value)
+
+    detected = _read_json_object(detected_loads_path)
+    ev_detected = detected.get("ev", {}) if isinstance(detected.get("ev"), dict) else {}
+    wallbox = ev_detected.get("wallbox", {}) if isinstance(ev_detected.get("wallbox"), dict) else {}
+    wallbox_power_w = _float_or_none(wallbox.get("charging_power_w")) if isinstance(wallbox, dict) else None
+    if (
+        isinstance(wallbox, dict)
+        and wallbox.get("available") is True
+        and wallbox_power_w is not None
+        and wallbox_power_w > ev_session.ACTIVE_POWER_THRESHOLD_W
+    ):
+        value = _float_or_none(wallbox.get("charging_energy_kwh"))
+        if value is not None:
+            candidates.append(value)
+
+    return max((v for v in candidates if v >= 0.0), default=0.0)
+
+
+def _ev_request_mostly_completed(
+    req: dict,
+    *,
+    ev_session_state_path: Path = EV_SESSION_STATE_PATH,
+    detected_loads_path: Path = DETECTED_LOADS_PATH,
+) -> bool:
+    target = _float_or_none(req.get("requested_ac_kwh_original"))
+    if target is None or target <= 0.0:
+        target = _float_or_none(req.get("required_ac_kwh"))
+    if target is None or target <= 0.0:
+        return False
+    delivered = _ev_physical_completion_kwh(
+        ev_session_state_path=ev_session_state_path,
+        detected_loads_path=detected_loads_path,
+    )
+    return delivered > target * EV_REPLAN_SKIP_COMPLETION_FRACTION
+
+
 def send_ev_schedule_change_alerts(
     *,
     now: datetime,
@@ -1160,6 +1243,8 @@ def send_ev_schedule_change_alerts(
     active_requests: list[dict],
     requests_path: Path = REQUESTS_PATH,
     alert_state_path: Path = ALERT_STATE_PATH,
+    ev_session_state_path: Path = EV_SESSION_STATE_PATH,
+    detected_loads_path: Path = DETECTED_LOADS_PATH,
 ) -> list[dict]:
     """Notify when an active EV start moves by at least the business threshold."""
 
@@ -1170,6 +1255,18 @@ def send_ev_schedule_change_alerts(
         if req.get("window_locked") or req.get("session_status") in ev_session.ACTIVE_STATES:
             continue
         request_id = _request_alert_key(req)
+        if _ev_request_mostly_completed(
+            req,
+            ev_session_state_path=ev_session_state_path,
+            detected_loads_path=detected_loads_path,
+        ):
+            outcomes.append({
+                "sent": False,
+                "reason": "ev_replan_skipped_mostly_completed",
+                "request_id": request_id,
+                "threshold_fraction": EV_REPLAN_SKIP_COMPLETION_FRACTION,
+            })
+            continue
         rec = req.get("recommendation", {}) if isinstance(req.get("recommendation"), dict) else {}
         if (
             rec.get("feasible") is not True

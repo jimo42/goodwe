@@ -689,6 +689,123 @@ def test_ev_schedule_change_retains_baseline_on_send_failure_and_retries():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_ev_schedule_change_skips_mostly_completed_physical_ev_session():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-09-19T14:07:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v11_test_ev_mostly_done_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        detected_path = Path(tmp) / "detected_loads.json"
+        session_path = Path(tmp) / "ev_session_state.json"
+        _write_ev_request_with_baseline(requests_path, baseline="2026-09-19T12:15:00+02:00")
+        detected_path.write_text(json.dumps({
+            "ev": {
+                "wallbox": {
+                    "available": True,
+                    "charging_energy_kwh": 8.5,
+                    "charging_power_w": 505.0,
+                }
+            }
+        }), encoding="utf-8")
+        session_path.write_text(json.dumps({
+            "state": "ACTIVE",
+            "delivered_kwh": 8.5,
+            "effective_target_kwh": 9.0,
+            "current_power_w": 505.0,
+        }), encoding="utf-8")
+
+        outcomes = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=[{
+                "id": "ev-1",
+                "type": "ev_charge",
+                "required_ac_kwh": 9.0,
+                "requested_ac_kwh_original": 9.0,
+                "recommendation": {
+                    "feasible": True,
+                    "recommended_start": "2026-09-20T10:15:00+02:00",
+                    "expected_end": "2026-09-20T13:45:00+02:00",
+                },
+            }],
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+            ev_session_state_path=session_path,
+            detected_loads_path=detected_path,
+        )
+        metadata = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        assert outcomes == [{
+            "sent": False,
+            "reason": "ev_replan_skipped_mostly_completed",
+            "request_id": "ev-1",
+            "threshold_fraction": planner.EV_REPLAN_SKIP_COMPLETION_FRACTION,
+        }]
+        assert calls == []
+        assert metadata["last_notified_start"] == "2026-09-19T12:15:00+02:00"
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_schedule_change_does_not_skip_stopped_ev_historical_counter():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-09-19T15:20:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v11_test_ev_stopped_counter_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        detected_path = Path(tmp) / "detected_loads.json"
+        session_path = Path(tmp) / "ev_session_state.json"
+        _write_ev_request_with_baseline(requests_path, baseline="2026-09-19T12:15:00+02:00")
+        detected_path.write_text(json.dumps({
+            "ev": {
+                "wallbox": {
+                    "available": True,
+                    "charging_energy_kwh": 8.5,
+                    "charging_power_w": 6.0,
+                }
+            }
+        }), encoding="utf-8")
+        session_path.write_text(json.dumps({
+            "state": "CLOSED",
+            "delivered_kwh": 8.5,
+            "current_power_w": 6.0,
+        }), encoding="utf-8")
+
+        outcomes = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=[{
+                "id": "ev-1",
+                "type": "ev_charge",
+                "required_ac_kwh": 9.0,
+                "requested_ac_kwh_original": 9.0,
+                "recommendation": {
+                    "feasible": True,
+                    "recommended_start": "2026-09-20T10:15:00+02:00",
+                    "expected_end": "2026-09-20T13:45:00+02:00",
+                },
+            }],
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+            ev_session_state_path=session_path,
+            detected_loads_path=detected_path,
+        )
+        assert len(outcomes) == 1
+        assert outcomes[0]["sent"] is True
+        assert len(calls) == 1
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_ev_schedule_change_skips_missing_baseline_start_infeasible_and_inactive_request():
     cfg = _cfg()
     now = datetime.fromisoformat("2026-08-04T00:30:00+02:00")
@@ -719,6 +836,39 @@ def test_ev_schedule_change_skips_missing_baseline_start_infeasible_and_inactive
     finally:
         planner.alerting.notify.send = original
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_active_ev_session_mostly_completed_suppresses_new_future_ev_window():
+    cfg = _cfg({"system": {"horizon_hours": 48}})
+    starts = [datetime(2026, 9, 19, 14, 15) + timedelta(minutes=15 * i) for i in range(192)]
+    opt_slots = [
+        optimizer.SlotInput(dt, 1.0, 0.0, True, False, 0.0, 0.1)
+        for dt in starts
+    ]
+    request = {
+        "id": "new-ev", "type": "ev_charge", "required_ac_kwh": 9.0,
+        "requested_ac_kwh_original": 9.0,
+        "deadline": datetime(2026, 9, 20, 14, 0), "available_from": starts[0],
+    }
+    session = {
+        "state": "ACTIVE", "session_id": "ev-stale-session",
+        "request_id": "old-ev", "effective_target_kwh": 9.0,
+        "delivered_kwh": 8.5, "request_remaining_kwh": 0.5,
+        "physical_remaining_to_max_kwh": 0.5, "current_power_w": 505.0,
+    }
+
+    ev_req, _boiler, summary = planner.choose_requests(
+        [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session, now=starts[0]
+    )
+
+    assert ev_req is None
+    ev_summary = next(item for item in summary if item.get("id") == "new-ev")
+    assert ev_summary["window_locked"] is True
+    assert ev_summary["mostly_completed_by_active_session"] is True
+    assert ev_summary["delivered_kwh"] == 8.5
+    assert ev_summary["request_remaining_kwh"] == 0.5
+    assert ev_summary["recommendation"]["recommended_start"] is None
+    assert "více než dvě třetiny" in ev_summary["recommendation"]["reason"]
 
 
 def test_active_ev_session_locks_current_window_and_reserves_to_physical_max():
