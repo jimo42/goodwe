@@ -32,8 +32,8 @@ def _cfg(overrides=None):
     return parse_config_dict(raw)
 
 
-def _sample(ts, *, export=1.0, phases=(0.5, 0.5, 0.5)):
-    return telemetry.MinuteSample(ts, 5.0, sum(phases), export, phases, (0.0, 0.0, 0.0), "test")
+def _sample(ts, *, export=1.0, phases=(0.5, 0.5, 0.5), pv=5.0):
+    return telemetry.MinuteSample(ts, pv, sum(phases), export, phases, (0.0, 0.0, 0.0), "test")
 
 
 def _write_report(path, ts, *, export=1000, phases=(500, 600, 700)):
@@ -68,6 +68,11 @@ def test_telemetry_uses_only_standard_reports_and_stable_export():
     assert evidence["export_min_kw"] == 1.0
     assert evidence["export_median_kw"] == 3.0
     assert evidence["export_latest_kw"] == 1.0
+    assert evidence["sample_window_seconds"] == 240.0
+    assert evidence["grid_power_avg_kw"] == 2.666667
+    assert evidence["grid_import_avg_kw"] == 0.0
+    assert evidence["grid_export_avg_kw"] == 2.666667
+    assert evidence["pv_avg_kw"] == 5.0
     assert evidence["stable_export_kw"] == 1.0
     assert evidence["latest_age_seconds"] == 0.0
 
@@ -247,9 +252,18 @@ def _probe_live(*, pv_kw=4.0, grid_kw=0.0, battery_kw=0.0):
     }
 
 
-def _probe_telemetry(delivery=(0.0, 0.0, 0.0), *, fresh=True):
+def _probe_telemetry(
+    delivery=(0.0, 0.0, 0.0), *, fresh=True, grid_avg=0.0, import_avg=0.0,
+    pv_avg=4.0, sample_window_seconds=300.0, sample_count=6,
+):
     return {
         "status": "OK", "latest_age_seconds": 0.0 if fresh else 999.0,
+        "sample_count": sample_count,
+        "sample_window_seconds": sample_window_seconds,
+        "grid_power_avg_kw": grid_avg,
+        "grid_import_avg_kw": import_avg,
+        "grid_export_avg_kw": max(0.0, grid_avg),
+        "pv_avg_kw": pv_avg,
         "reconstructed_pre_boiler_surplus_kw": 0.0,
         "confirmed_phase_delivery_kw": list(delivery),
         "robust_phase_baseline_kw": [0.8, 0.9, 1.0],
@@ -305,7 +319,7 @@ def test_curtailment_probe_falls_back_to_import_tolerance_without_price():
 
     rolled_back = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
-        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0), import_avg=0.8),
         ledger=state, export_limit_state=_zero_export(), slot=None, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert rolled_back["kind"] == "rollback"
@@ -361,15 +375,18 @@ def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_impor
     assert accepted["kind"] == "accept"
     cheap_imported = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
-        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        live_state=_probe_live(pv_kw=4.0, grid_kw=-3.0), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0), import_avg=0.8),
         ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert cheap_imported["kind"] == "accept"
+    assert cheap_imported["evidence"]["grid_kw"] == -3.0
+    assert cheap_imported["evidence"]["grid_import_avg_kw"] == 0.8
+    assert cheap_imported["evidence"]["price_economics"]["evaluation_basis"] == "observed_grid_import_avg"
     assert cheap_imported["evidence"]["price_economics"]["economic"] is True
 
     expensive_imported = executor.curtailment_probe_transition(
         current_mask=(True, False, False), requested_phases=0, hard_active=False,
-        live_state=_probe_live(pv_kw=4.0, grid_kw=-0.8), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0)),
+        live_state=_probe_live(pv_kw=4.0, grid_kw=0.0), telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0), import_avg=0.8),
         ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": 200.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert expensive_imported["kind"] == "rollback"
@@ -380,6 +397,51 @@ def test_curtailment_probe_accepts_only_fresh_delivery_pv_response_without_impor
         ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
     )
     assert discharged["kind"] == "rollback"
+
+
+def test_curtailment_probe_evaluates_executor_window_before_exact_observe_after():
+    cfg = _probe_cfg()
+    started = datetime(2026, 8, 16, 14, 0, 5, tzinfo=ZoneInfo(cfg.system.timezone))
+    now = datetime(2026, 8, 16, 14, 5, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    state = boiler_state.empty_state()
+    state["curtailment_probe"].update({
+        "status": "observing", "started_at": started.isoformat(),
+        "observe_after": (started + timedelta(minutes=cfg.boiler.curtailment_probe_observe_minutes)).isoformat(),
+        "previous_mask": [False, False, False], "probed_mask": [True, False, False], "baseline_pv_kw": 2.0,
+    })
+    transition = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=1.0, grid_kw=-3.0),
+        telemetry_evidence=_probe_telemetry(
+            (2.0, 0.0, 0.0), grid_avg=-0.8, import_avg=0.8, pv_avg=4.0, sample_window_seconds=295.0, sample_count=6,
+        ),
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert now < datetime.fromisoformat(state["curtailment_probe"]["observe_after"])
+    assert transition["kind"] == "accept"
+    assert transition["evidence"]["observation_window_ready"] is True
+    assert transition["evidence"]["pv_response_kw"] == 2.0
+    assert transition["evidence"]["price_economics"]["import_covered_kw"] == 0.8
+
+
+def test_curtailment_probe_holds_when_executor_window_is_too_short():
+    cfg = _probe_cfg()
+    started = datetime(2026, 8, 16, 14, 0, 5, tzinfo=ZoneInfo(cfg.system.timezone))
+    now = datetime(2026, 8, 16, 14, 1, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    state = boiler_state.empty_state()
+    state["curtailment_probe"].update({
+        "status": "observing", "started_at": started.isoformat(),
+        "observe_after": (started + timedelta(minutes=cfg.boiler.curtailment_probe_observe_minutes)).isoformat(),
+        "previous_mask": [False, False, False], "probed_mask": [True, False, False], "baseline_pv_kw": 2.0,
+    })
+    transition = executor.curtailment_probe_transition(
+        current_mask=(True, False, False), requested_phases=0, hard_active=False,
+        live_state=_probe_live(pv_kw=4.0),
+        telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0), sample_window_seconds=55.0, sample_count=2),
+        ledger=state, export_limit_state=_zero_export(), slot={"price_eur_mwh": -20.0}, forecast_doc={"slots": []}, now=now, cfg=cfg,
+    )
+    assert transition["kind"] == "hold"
+    assert transition["reason"] == "BOILER_EXPORT_CURTAILMENT_PROBE_OBSERVING"
 
 
 def test_curtailment_probe_blocks_stale_data_and_cancels_when_relay_mask_changes():
@@ -430,10 +492,6 @@ def test_curtailment_probe_persists_only_after_verified_relay_target_and_sets_co
     assert rolled_back["curtailment_probe"]["cooldown_until"] is not None
 
 
-def test_curtailment_probe_observe_can_be_shorter_than_minimum_on_time():
-    with open(CONFIG_PATH, "rb") as handle:
-        raw = copy.deepcopy(tomllib.load(handle))
-    raw["boiler"]["curtailment_probe_observe_minutes"] = 1
-    cfg = parse_config_dict(raw)
-    assert cfg.boiler.curtailment_probe_observe_minutes == 1
-    assert cfg.boiler.curtailment_probe_observe_minutes < cfg.boiler.minimum_on_minutes
+def test_curtailment_probe_observe_matches_executor_step_by_default():
+    cfg = _probe_cfg()
+    assert cfg.boiler.curtailment_probe_observe_minutes == cfg.system.execution_step_minutes == 5

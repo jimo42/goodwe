@@ -545,6 +545,26 @@ def _probe_fresh(telemetry_evidence: dict, cfg: Config) -> bool:
         return False
 
 
+def _probe_observation_window_ready(telemetry_evidence: dict, cfg: Config) -> bool:
+    """Accept one executor-cycle observation even if wall-clock observe_after is missed by seconds."""
+    if not _probe_fresh(telemetry_evidence, cfg):
+        return False
+    try:
+        sample_count = int(telemetry_evidence.get("sample_count", 0) or 0)
+        window_seconds = float(telemetry_evidence.get("sample_window_seconds", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    target_seconds = float(cfg.boiler.curtailment_probe_observe_minutes) * 60.0
+    executor_seconds = float(cfg.system.execution_step_minutes) * 60.0
+    # Minute reports are not exactly aligned with executor start/finish, so allow
+    # a small grace window. This prevents a probe that has effectively covered one
+    # executor period from being held for another full cycle just because this run
+    # started a few seconds before observe_after.
+    tolerance_seconds = min(60.0, max(15.0, executor_seconds * 0.2))
+    required_seconds = max(0.0, min(target_seconds, executor_seconds) - tolerance_seconds)
+    return sample_count >= 2 and window_seconds >= required_seconds
+
+
 def _probe_one_additional_mask(
     *, current_mask: tuple[bool, bool, bool], live_state: dict, ledger: dict, now: datetime, cfg: Config,
 ) -> tuple[Optional[tuple[bool, bool, bool]], dict]:
@@ -573,6 +593,7 @@ def _probe_one_additional_mask(
 def probe_mask_economics(
     *, target_mask: tuple[bool, bool, bool], slot: Optional[dict], forecast_doc: Optional[dict],
     now: datetime, cfg: Config, telemetry_evidence: dict, observed_grid_kw: Optional[float] = None,
+    observed_import_kw: Optional[float] = None,
 ) -> dict:
     target_kw = sum(1 for value in target_mask if value) * cfg.boiler.phase_power_kw
     gas_value = economics.gas_heat_value_czk_per_kwh(cfg)
@@ -581,16 +602,19 @@ def probe_mask_economics(
     import_cost = economics.import_cost_czk_per_kwh(spot, cfg)
     export_opportunity = economics.export_revenue_czk_per_kwh(spot, cfg)
     pre_surplus = max(0.0, float(telemetry_evidence.get("reconstructed_pre_boiler_surplus_kw", 0.0) or 0.0))
-    if observed_grid_kw is None:
+    if observed_import_kw is not None:
+        # During an active zero-export probe, PV output can be curtailed and one
+        # instantaneous grid reading can be noisy.  Use the average imported power
+        # measured across the whole executor observation window; the remainder of
+        # the probed boiler load is valued as released PV/export opportunity.
+        import_kw = min(target_kw, max(0.0, float(observed_import_kw)))
+        surplus_kw = max(0.0, target_kw - import_kw)
+        basis = "observed_grid_import_avg"
+    elif observed_grid_kw is None:
         surplus_kw = min(target_kw, pre_surplus)
         import_kw = max(0.0, target_kw - surplus_kw)
         basis = "reconstructed_pre_boiler_surplus"
     else:
-        # During an active zero-export probe, current PV output can be curtailed and
-        # therefore is not a reliable measure of true irradiance.  Net grid import
-        # after adding the boiler is the best direct evidence of how much of the
-        # delivered boiler power is actually bought from the grid; the remainder is
-        # valued as released PV/export opportunity.
         import_kw = min(target_kw, max(0.0, -float(observed_grid_kw)))
         surplus_kw = max(0.0, target_kw - import_kw)
         basis = "observed_grid_import"
@@ -640,23 +664,32 @@ def curtailment_probe_transition(
         if current_mask != probed_mask:
             return {"kind": "cancel", "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_RELAY_MASK_CHANGED"}
         observe_after = _parse_optional_datetime(state.get("observe_after"), ZoneInfo(cfg.system.timezone))
-        if observe_after is None or now < observe_after:
+        window_ready = _probe_observation_window_ready(telemetry_evidence, cfg)
+        if (observe_after is None or now < observe_after) and not window_ready:
             return {"kind": "hold", "target_mask": probed_mask, "reason": "BOILER_EXPORT_CURTAILMENT_PROBE_OBSERVING"}
-        pv_kw = _live_kw(live_state, "ppv1")
-        pv2_kw = _live_kw(live_state, "ppv2")
         grid_kw = _live_kw(live_state, "meter_active_power_total")
         battery_kw = _live_kw(live_state, "pbattery1")
         baseline_pv = state.get("baseline_pv_kw")
+        grid_avg_kw = telemetry_evidence.get("grid_power_avg_kw")
+        import_avg_kw = telemetry_evidence.get("grid_import_avg_kw")
+        pv_avg_kw = telemetry_evidence.get("pv_avg_kw")
         delivery = telemetry_evidence.get("confirmed_phase_delivery_kw")
         added = [idx for idx, (before, after) in enumerate(zip(previous_mask, probed_mask)) if after and not before]
         delivered = (
             isinstance(delivery, list) and len(added) == 1 and len(delivery) == 3
             and float(delivery[added[0]] or 0.0) >= 1.0
         )
-        pv_response = None if pv_kw is None or pv2_kw is None or baseline_pv is None else pv_kw + pv2_kw - float(baseline_pv)
+        try:
+            pv_response = None if pv_avg_kw is None or baseline_pv is None else float(pv_avg_kw) - float(baseline_pv)
+        except (TypeError, ValueError):
+            pv_response = None
+        try:
+            observed_import_avg_kw = None if import_avg_kw is None else float(import_avg_kw)
+        except (TypeError, ValueError):
+            observed_import_avg_kw = None
         economics_evidence = probe_mask_economics(
             target_mask=probed_mask, slot=slot, forecast_doc=forecast_doc, now=now, cfg=cfg,
-            telemetry_evidence=telemetry_evidence, observed_grid_kw=grid_kw,
+            telemetry_evidence=telemetry_evidence, observed_import_kw=observed_import_avg_kw,
         )
         accepted = (
             _probe_fresh(telemetry_evidence, cfg)
@@ -666,11 +699,14 @@ def curtailment_probe_transition(
             and (
                 economics_evidence["economic"]
                 if economics_evidence.get("economic_available")
-                else grid_kw is not None and grid_kw >= -cfg.boiler.curtailment_probe_import_tolerance_kw
+                else observed_import_avg_kw is not None and observed_import_avg_kw <= cfg.boiler.curtailment_probe_import_tolerance_kw
             )
         )
         evidence = {
-            "grid_kw": grid_kw, "battery_kw": battery_kw, "pv_response_kw": pv_response,
+            "grid_kw": grid_kw, "grid_avg_kw": grid_avg_kw, "grid_import_avg_kw": observed_import_avg_kw,
+            "battery_kw": battery_kw, "pv_avg_kw": pv_avg_kw, "pv_response_kw": pv_response,
+            "observation_window_ready": window_ready,
+            "sample_window_seconds": telemetry_evidence.get("sample_window_seconds"),
             "added_phase_delivery_confirmed": delivered, "telemetry_fresh": _probe_fresh(telemetry_evidence, cfg),
             "price_economics": economics_evidence,
         }

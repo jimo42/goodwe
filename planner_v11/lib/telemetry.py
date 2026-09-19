@@ -1,8 +1,10 @@
 """Recent minute telemetry used by the five-minute boiler controller.
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 Changelog:
+- v1.2 (2026-09-19): Add whole-observation-window PV/grid averages
+  for curtailment probe evaluation.
 - v1.1 (2026-08-02): Deterministic replay age, local parsers, persisted
   OFF-baseline support and confirmed-delivery surplus reconstruction.
 - v1.0 (2026-08-02): Parse standard GoodWe minute reports, combine them with
@@ -20,7 +22,7 @@ from typing import Any, Optional
 
 from . import load_model, paths
 
-VERSION = "1.1"
+VERSION = "1.2"
 _STANDARD_REPORT_RE = re.compile(r"^goodwe_stats_\d{8}_\d{6}$")
 
 
@@ -129,9 +131,13 @@ def robust_evidence(
     if not samples:
         return {"sample_count": 0, "status": "TELEMETRY_UNAVAILABLE"}
     exports = [sample.export_kw for sample in samples]
+    pv_values = [sample.pv_kw for sample in samples]
+    import_values = [max(0.0, -sample.export_kw) for sample in samples]
+    export_values = [max(0.0, sample.export_kw) for sample in samples]
     latest = exports[-1]
     median = statistics.median(exports)
     stable = min(latest, median)
+    window_seconds = max(0.0, (samples[-1].timestamp - samples[0].timestamp).total_seconds())
     persisted = persisted_phase_baseline_kw if isinstance(persisted_phase_baseline_kw, list) and len(persisted_phase_baseline_kw) == 3 else [None, None, None]
     phase_baseline = []
     confirmed_phase_delivery_kw = []
@@ -160,6 +166,11 @@ def robust_evidence(
         "oldest_at": samples[0].timestamp.isoformat(),
         "latest_at": samples[-1].timestamp.isoformat(),
         "latest_age_seconds": max(0.0, (reference_now - samples[-1].timestamp).total_seconds()),
+        "sample_window_seconds": round(window_seconds, 6),
+        "grid_power_avg_kw": round(statistics.fmean(exports), 6),
+        "grid_import_avg_kw": round(statistics.fmean(import_values), 6),
+        "grid_export_avg_kw": round(statistics.fmean(export_values), 6),
+        "pv_avg_kw": round(statistics.fmean(pv_values), 6),
         "export_min_kw": round(min(exports), 6),
         "export_median_kw": round(median, 6),
         "export_latest_kw": round(latest, 6),
