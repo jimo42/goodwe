@@ -1807,6 +1807,30 @@ def send_executor_alerts(
     return outcomes
 
 
+def persist_ev_completion_notification_if_sent(
+    *,
+    alerts: list[dict],
+    session_state: dict,
+    ev_session_path: Path,
+    now: datetime,
+) -> dict:
+    """Persist EV completion notification time only for a newly sent completion alert."""
+
+    completion_alert_sent = any(
+        isinstance(outcome, dict)
+        and outcome.get("sent") is True
+        and str(outcome.get("key") or "").startswith("executor.ev_session_completed.")
+        for outcome in alerts
+    )
+    if completion_alert_sent and session_state.get("session_id"):
+        return ev_session.mark_completion_notification_sent(
+            ev_session_path,
+            session_id=str(session_state["session_id"]),
+            now=now,
+        )
+    return session_state
+
+
 async def read_live_state_or_fail(cfg: Optional[Config] = None) -> dict:
     live = await planner_module.read_live_state()
     if (cfg is None or getattr(cfg.battery, "enabled", True)) and live.get("battery_soc") is None:
@@ -1993,13 +2017,13 @@ def run_executor(
         today = boiler_state.today_entry(ledger, now.date())
         if today.get("full_notification_sent_at"):
             atomic_write_json(boiler_state_path, ledger)
-    if session_state.get("completion_notification_sent_at") and session_state.get("session_id"):
-        session_state = ev_session.mark_completion_notification_sent(
-            ev_session_path,
-            session_id=str(session_state["session_id"]),
-            now=now,
-        )
-        runtime["ev_charging_session"] = session_state
+    session_state = persist_ev_completion_notification_if_sent(
+        alerts=alerts,
+        session_state=session_state,
+        ev_session_path=ev_session_path,
+        now=now,
+    )
+    runtime["ev_charging_session"] = session_state
     runtime["alerts"] = alerts
     atomic_write_json(DETECTED_LOADS_PATH, detected_loads)
     atomic_write_json(runtime_path, runtime)

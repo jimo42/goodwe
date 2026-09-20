@@ -697,14 +697,14 @@ def choose_requests(
             original_required = float(req.get("requested_ac_kwh_original", req["required_ac_kwh"]))
             effective_target = min(ev_session.MAX_SESSION_KWH, max(0.0, float(req["required_ac_kwh"])))
             req_id = str(req.get("id") or req.get("request_id") or "")
-            delivered = 0.0
-            if session_request_id == req_id or session_status in ev_session.ACTIVE_STATES:
-                delivered = max(0.0, float(session.get("delivered_kwh", 0.0) or 0.0))
+            session_delivered = max(0.0, float(session.get("delivered_kwh", 0.0) or 0.0))
+            physical_session_delivered = session_delivered if session_status in ev_session.ACTIVE_STATES else 0.0
+            delivered = session_delivered if session_request_id == req_id else 0.0
             raw_remaining = round(max(0.0, effective_target - delivered), 3)
             mostly_completed_by_active_session = (
                 session_status in ev_session.ACTIVE_STATES
                 and effective_target > 0.0
-                and delivered > effective_target * EV_REPLAN_SKIP_COMPLETION_FRACTION
+                and physical_session_delivered > effective_target * EV_REPLAN_SKIP_COMPLETION_FRACTION
             )
             closure_tolerated = (
                 session_status == "CLOSED"
@@ -1218,22 +1218,60 @@ def _ev_physical_completion_kwh(
     return max((v for v in candidates if v >= 0.0), default=0.0)
 
 
+def _ev_request_target_kwh(req: dict) -> float | None:
+    target = _float_or_none(req.get("requested_ac_kwh_original"))
+    if target is None or target <= 0.0:
+        target = _float_or_none(req.get("required_ac_kwh"))
+    return target if target is not None and target > 0.0 else None
+
+
 def _ev_request_mostly_completed(
     req: dict,
     *,
     ev_session_state_path: Path = EV_SESSION_STATE_PATH,
     detected_loads_path: Path = DETECTED_LOADS_PATH,
 ) -> bool:
-    target = _float_or_none(req.get("requested_ac_kwh_original"))
-    if target is None or target <= 0.0:
-        target = _float_or_none(req.get("required_ac_kwh"))
-    if target is None or target <= 0.0:
+    target = _ev_request_target_kwh(req)
+    if target is None:
         return False
     delivered = _ev_physical_completion_kwh(
         ev_session_state_path=ev_session_state_path,
         detected_loads_path=detected_loads_path,
     )
     return delivered > target * EV_REPLAN_SKIP_COMPLETION_FRACTION
+
+
+def _ev_schedule_change_request_is_stale(req: dict, now: datetime, tz: ZoneInfo) -> str | None:
+    status = str(req.get("status") or "active").lower()
+    if status != "active":
+        return "ev_schedule_request_not_active"
+
+    for key, reason in (("cancelled_at", "ev_schedule_request_cancelled"), ("completed_at", "ev_schedule_request_completed")):
+        if req.get(key):
+            return reason
+
+    deadline = req.get("deadline")
+    if deadline:
+        try:
+            if parse_iso_datetime(str(deadline), tz) <= now:
+                return "ev_schedule_request_expired"
+        except (TypeError, ValueError):
+            pass
+
+    remaining = _float_or_none(req.get("remaining_kwh"))
+    if remaining is None:
+        remaining = _float_or_none(req.get("request_remaining_kwh"))
+    if remaining is not None and remaining <= 0.0:
+        return "ev_schedule_request_completed"
+
+    target = _ev_request_target_kwh(req)
+    delivered = _float_or_none(req.get("delivered_kwh"))
+    if delivered is None:
+        delivered = _float_or_none(req.get("request_credited_kwh"))
+    if target is not None and delivered is not None and delivered >= target:
+        return "ev_schedule_request_completed"
+
+    return None
 
 
 def send_ev_schedule_change_alerts(
@@ -1255,6 +1293,10 @@ def send_ev_schedule_change_alerts(
         if req.get("window_locked") or req.get("session_status") in ev_session.ACTIVE_STATES:
             continue
         request_id = _request_alert_key(req)
+        stale_reason = _ev_schedule_change_request_is_stale(req, now, ZoneInfo(cfg.system.timezone))
+        if stale_reason:
+            outcomes.append({"sent": False, "reason": stale_reason, "request_id": request_id})
+            continue
         if _ev_request_mostly_completed(
             req,
             ev_session_state_path=ev_session_state_path,

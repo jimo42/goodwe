@@ -689,6 +689,66 @@ def test_ev_schedule_change_retains_baseline_on_send_failure_and_retries():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+def test_ev_schedule_change_suppresses_completed_stale_request():
+    cfg = _cfg()
+    now = datetime.fromisoformat("2026-09-20T04:07:00+02:00")
+    tmp = tempfile.mkdtemp(prefix="planner_v11_test_ev_stale_schedule_")
+    original = planner.alerting.notify.send
+    calls = []
+    planner.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    try:
+        requests_path = Path(tmp) / "requests.json"
+        alert_path = Path(tmp) / "alert_state.json"
+        requests_path.write_text(json.dumps({
+            "requests": [{
+                "id": "ev-done",
+                "request_id": "ev-done",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 9.0,
+                "remaining_kwh": 0.0,
+                "deadline": "2026-09-20T06:00:00+02:00",
+                "ev_schedule_notification": {
+                    "initial_notified_start": "2026-09-20T01:00:00+02:00",
+                    "initial_notified_end": "2026-09-20T04:00:00+02:00",
+                    "initial_notified_at": "2026-09-19T15:00:00+02:00",
+                    "last_notified_start": "2026-09-20T01:00:00+02:00",
+                    "last_notified_end": "2026-09-20T04:00:00+02:00",
+                    "last_notified_at": "2026-09-19T15:00:00+02:00",
+                },
+            }]
+        }), encoding="utf-8")
+
+        outcomes = planner.send_ev_schedule_change_alerts(
+            now=now,
+            cfg=cfg,
+            active_requests=[{
+                "id": "ev-done",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 9.0,
+                "remaining_kwh": 0.0,
+                "deadline": "2026-09-20T06:00:00+02:00",
+                "recommendation": {
+                    "feasible": True,
+                    "recommended_start": "2026-09-20T10:15:00+02:00",
+                    "expected_end": "2026-09-20T13:45:00+02:00",
+                },
+            }],
+            requests_path=requests_path,
+            alert_state_path=alert_path,
+        )
+
+        metadata = json.loads(requests_path.read_text(encoding="utf-8"))["requests"][0]["ev_schedule_notification"]
+        assert outcomes == [{"sent": False, "reason": "ev_schedule_request_completed", "request_id": "ev-done"}]
+        assert calls == []
+        assert metadata["last_notified_start"] == "2026-09-20T01:00:00+02:00"
+    finally:
+        planner.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def test_ev_schedule_change_skips_mostly_completed_physical_ev_session():
     cfg = _cfg()
     now = datetime.fromisoformat("2026-09-19T14:07:00+02:00")
@@ -865,8 +925,8 @@ def test_active_ev_session_mostly_completed_suppresses_new_future_ev_window():
     ev_summary = next(item for item in summary if item.get("id") == "new-ev")
     assert ev_summary["window_locked"] is True
     assert ev_summary["mostly_completed_by_active_session"] is True
-    assert ev_summary["delivered_kwh"] == 8.5
-    assert ev_summary["request_remaining_kwh"] == 0.5
+    assert ev_summary["delivered_kwh"] == 0.0
+    assert ev_summary["request_remaining_kwh"] == 9.0
     assert ev_summary["recommendation"]["recommended_start"] is None
     assert "více než dvě třetiny" in ev_summary["recommendation"]["reason"]
 
@@ -1096,6 +1156,8 @@ def test_active_ev_session_does_not_lock_different_new_user_request():
     assert ev_summary["deadline"] == "2026-09-19T11:15:00"
     assert ev_summary["requested_ac_kwh_original"] == 9.0
     assert ev_summary["required_ac_kwh"] == 9.0
+    assert ev_summary["delivered_kwh"] == 0.0
+    assert ev_summary["request_remaining_kwh"] == 9.0
     rec = ev_summary["recommendation"]
     assert rec["feasible"] is True
     assert rec["recommended_start"] != starts[0].isoformat()

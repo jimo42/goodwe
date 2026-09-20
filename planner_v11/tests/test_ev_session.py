@@ -116,3 +116,27 @@ def test_replan_claim_is_idempotent():
         assert state["last_replan_reason"] == "EV_SESSION_STARTED"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_completion_notification_marker_is_idempotent():
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_completion_marker_"))
+    try:
+        path = tmp / "ev_session.json"
+        original = "2026-08-07T12:00:00+02:00"
+        ev_session.write_state(path, {
+            "session_id": "ev-session",
+            "state": "CLOSED",
+            "completion_notification_sent_at": original,
+        })
+
+        state = ev_session.mark_completion_notification_sent(
+            path,
+            session_id="ev-session",
+            now=datetime(2026, 8, 7, 12, 30, tzinfo=TZ),
+        )
+
+        assert state["completion_notification_sent_at"] == original
+        assert ev_session.read_state(path)["completion_notification_sent_at"] == original
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+

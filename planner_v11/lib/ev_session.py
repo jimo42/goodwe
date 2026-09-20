@@ -119,11 +119,13 @@ def write_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def mark_completion_notification_sent(path: Path, *, session_id: str, now: datetime) -> dict[str, Any]:
-    """Mark only the current matching session without reverting replan claims."""
+    """Mark only the current matching session once without reverting replan claims."""
 
     with request_store.request_store_lock(path):
         current = read_state(path)
         if current.get("session_id") != session_id:
+            return current
+        if current.get("completion_notification_sent_at"):
             return current
         current["completion_notification_sent_at"] = _iso(now)
         write_state(path, current)

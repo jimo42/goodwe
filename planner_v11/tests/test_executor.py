@@ -867,3 +867,30 @@ def test_battery_disabled_skips_eco_write_and_soc_deviation():
     detected, reason = executor.detect_plan_deviation({"soc_start_pct": 50.0}, {"battery_soc": None}, cfg, now=now)
     assert detected is False
     assert reason == "BATTERY_DISABLED"
+
+
+def test_executor_preserves_existing_ev_completion_notification_timestamp():
+    now = datetime(2026, 8, 7, 13, 0, tzinfo=ZoneInfo("Europe/Prague"))
+    original = "2026-08-07T12:00:00+02:00"
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_executor_ev_completion_marker_"))
+    try:
+        session_path = tmp / "ev_session.json"
+        executor.ev_session.write_state(session_path, {
+            "session_id": "ev-session",
+            "state": "CLOSED",
+            "completion_notification_sent_at": original,
+        })
+        session_state = executor.ev_session.read_state(session_path)
+
+        persisted = executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": False, "reason": "deduplicated", "key": "executor.ev_session_completed.ev-session"}],
+            session_state=session_state,
+            ev_session_path=session_path,
+            now=now,
+        )
+
+        assert persisted["completion_notification_sent_at"] == original
+        assert executor.ev_session.read_state(session_path)["completion_notification_sent_at"] == original
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
