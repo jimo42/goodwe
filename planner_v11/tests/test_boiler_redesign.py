@@ -135,7 +135,7 @@ def test_reconstructed_surplus_adds_only_confirmed_boiler_delivery():
     assert unknown["reconstructed_pre_boiler_surplus_kw"] == 1.0
 
 
-def test_economic_candidates_mix_surplus_and_import_and_future_pv_blocks_import():
+def test_economic_candidates_mix_surplus_and_import_and_ignores_negligible_future_gain():
     cfg = _cfg()
     now = datetime(2026, 8, 2, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
     slot = {"price_eur_mwh": -20.0}
@@ -149,14 +149,143 @@ def test_economic_candidates_mix_surplus_and_import_and_future_pv_blocks_import(
 
     future_slot = {
         "slot_start": (now + timedelta(hours=1)).isoformat(), "pv_estimate_kwh": 2.0,
-        "fixed_load_kwh": 0.1, "export_revenue_czk_kwh": -1.0,
+        "fixed_load_kwh": 0.1, "export_revenue_czk_kwh": 2.45,
     }
-    blocked = executor.economic_boiler_candidates(
+    allowed = executor.economic_boiler_candidates(
         slot={"price_eur_mwh": 0.0}, forecast_doc={"slots": [future_slot]}, now=now, cfg=cfg,
         telemetry_evidence={"reconstructed_pre_boiler_surplus_kw": 1.0},
     )
-    assert blocked["target_phases"] == 0
-    assert blocked["candidates"][1]["future_solar_better_for_import"] is True
+    candidate = allowed["candidates"][1]
+    assert candidate["future_solar_better_for_import"] is True  # legacy diagnostic only
+    assert candidate["future_deferral"]["should_defer"] is False
+    assert candidate["future_deferral"]["reason"] == "future_delta_negligible"
+    assert candidate["economic"] is True
+    assert allowed["target_phases"] >= 1
+
+
+def test_economic_candidates_defer_for_long_material_future_window():
+    cfg = _cfg({"boiler": {"max_wait_if_current_mixed_below_gas_czk_kwh": 2.0}})
+    now = datetime(2026, 8, 2, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    future_slots = [
+        {
+            "slot_start": (now + timedelta(minutes=15 * i)).isoformat(),
+            "pv_estimate_kwh": 0.75,
+            "fixed_load_kwh": 0.0,
+            "export_revenue_czk_kwh": 0.20,
+        }
+        for i in range(1, 14)
+    ]
+    blocked = executor.economic_boiler_candidates(
+        slot={"price_eur_mwh": 0.0}, forecast_doc={"slots": future_slots}, now=now, cfg=cfg,
+        telemetry_evidence={"reconstructed_pre_boiler_surplus_kw": 1.0},
+    )
+    candidate = blocked["candidates"][1]
+    assert candidate["future_deferral"]["should_defer"] is True
+    assert candidate["future_deferral"]["reason"] == "long_material_future_window"
+    assert candidate["economic"] is False
+
+
+def test_economic_candidates_prefill_before_short_negative_price_window():
+    cfg = _cfg()
+    now = datetime(2026, 8, 2, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    future_slots = [
+        {
+            "slot_start": (now + timedelta(hours=4, minutes=15 * i)).isoformat(),
+            "pv_estimate_kwh": 0.75,
+            "fixed_load_kwh": 0.0,
+            "export_revenue_czk_kwh": -1.00,
+        }
+        for i in range(4)
+    ]
+    allowed = executor.economic_boiler_candidates(
+        slot={"price_eur_mwh": 0.0}, forecast_doc={"slots": future_slots}, now=now, cfg=cfg,
+        telemetry_evidence={"reconstructed_pre_boiler_surplus_kw": 1.0},
+    )
+    candidate = allowed["candidates"][1]
+    assert candidate["future_deferral"]["should_defer"] is False
+    assert candidate["future_deferral"]["reason"] == "prefill_before_short_future_window"
+    assert candidate["future_deferral"]["short_spike_reserve_kwh"] > 0
+    assert candidate["economic"] is True
+
+
+def test_future_deferral_sees_short_price_spike_without_solar_surplus():
+    cfg = _cfg()
+    now = datetime(2026, 8, 2, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    future_slots = [
+        {
+            "slot_start": (now + timedelta(hours=4, minutes=15 * i)).isoformat(),
+            "pv_estimate_kwh": 0.0,
+            "fixed_load_kwh": 0.0,
+            "price_eur_mwh": -100.0,
+            "export_revenue_czk_kwh": 0.0,
+        }
+        for i in range(4)
+    ]
+    decision = executor.future_boiler_deferral_decision(
+        current_mixed_cost=1.20,
+        current_import_cost=2.54,
+        current_import_kw=1.0,
+        target_kw=2.0,
+        gas_value=economics.gas_heat_value_czk_per_kwh(cfg),
+        forecast_doc={"slots": future_slots},
+        now=now,
+        cfg=cfg,
+        remaining_need_kwh=8.0,
+    )
+    assert decision["best_future_solar_opportunity_today"] is None
+    assert decision["best_future_boiler_opportunity_today"]["mixed_cost_czk_kwh"] < 0.1
+    assert decision["should_defer"] is False
+    assert decision["reason"] == "prefill_before_short_future_window"
+    assert decision["short_spike_reserve_kwh"] > 0
+
+
+def test_future_deferral_reserves_when_only_short_price_spike_need_remains():
+    cfg = _cfg({"boiler": {"future_price_spike_reserve_fraction": 1.0}})
+    now = datetime(2026, 8, 2, 10, 0, tzinfo=ZoneInfo(cfg.system.timezone))
+    future_slots = [
+        {
+            "slot_start": (now + timedelta(hours=4, minutes=15 * i)).isoformat(),
+            "pv_estimate_kwh": 0.0,
+            "fixed_load_kwh": 0.0,
+            "price_eur_mwh": -100.0,
+            "export_revenue_czk_kwh": 0.0,
+        }
+        for i in range(4)
+    ]
+    decision = executor.future_boiler_deferral_decision(
+        current_mixed_cost=1.20,
+        current_import_cost=2.54,
+        current_import_kw=1.0,
+        target_kw=2.0,
+        gas_value=economics.gas_heat_value_czk_per_kwh(cfg),
+        forecast_doc={"slots": future_slots},
+        now=now,
+        cfg=cfg,
+        remaining_need_kwh=1.0,
+    )
+    assert decision["should_defer"] is True
+    assert decision["reason"] == "reserve_for_short_future_window"
+
+
+def test_probe_economics_accepts_probe_when_future_gain_is_not_material():
+    cfg = _probe_cfg()
+    now = datetime(2026, 8, 16, 10, 55, tzinfo=ZoneInfo(cfg.system.timezone))
+    future_slot = {
+        "slot_start": (now + timedelta(hours=1)).isoformat(),
+        "pv_estimate_kwh": 0.5,
+        "fixed_load_kwh": 0.0,
+        "export_revenue_czk_kwh": -0.20,
+    }
+    economics_result = executor.probe_mask_economics(
+        target_mask=(True, False, False), slot={"price_eur_mwh": 0.0},
+        forecast_doc={"slots": [future_slot]}, now=now, cfg=cfg,
+        telemetry_evidence=_probe_telemetry((2.0, 0.0, 0.0), import_avg=0.14),
+        observed_import_kw=0.14,
+    )
+    assert economics_result["mixed_cost_czk_kwh"] < economics_result["gas_heat_value_czk_kwh"]
+    assert economics_result["future_solar_better_for_import"] is True
+    assert economics_result["future_deferral"]["should_defer"] is False
+    assert economics_result["economic"] is True
 
 
 def test_phase_selection_least_loaded_hysteresis_minimum_times_and_headroom():

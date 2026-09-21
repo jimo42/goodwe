@@ -619,9 +619,12 @@ def probe_mask_economics(
         surplus_kw = max(0.0, target_kw - import_kw)
         basis = "observed_grid_import"
     mixed_cost = 0.0 if target_kw == 0 else (surplus_kw * export_opportunity + import_kw * import_cost) / target_kw
-    future = best_future_solar_opportunity_today(forecast_doc, now, cfg)
-    future_cost = future.get("opportunity_cost_czk_kwh") if future else None
-    future_better = import_kw > 0 and future_cost is not None and future_cost + 1e-9 < import_cost
+    future_deferral = future_boiler_deferral_decision(
+        current_mixed_cost=mixed_cost, current_import_cost=import_cost, current_import_kw=import_kw, target_kw=target_kw,
+        gas_value=gas_value, forecast_doc=forecast_doc, now=now, cfg=cfg,
+    )
+    future_better = bool(future_deferral.get("legacy_future_solar_better_for_import"))
+    should_defer = bool(future_deferral.get("should_defer"))
     return {
         "target_kw": round(target_kw, 6),
         "surplus_covered_kw": round(surplus_kw, 6),
@@ -630,11 +633,12 @@ def probe_mask_economics(
         "gas_heat_value_czk_kwh": round(gas_value, 6),
         "import_cost_czk_kwh": round(import_cost, 6),
         "export_opportunity_czk_kwh": round(export_opportunity, 6),
-        "best_future_solar_opportunity_today": future,
+        "best_future_solar_opportunity_today": future_deferral.get("best_future_solar_opportunity_today"),
         "future_solar_better_for_import": future_better,
+        "future_deferral": future_deferral,
         "evaluation_basis": basis,
         "economic_available": price_available,
-        "economic": price_available and (target_kw == 0 or (mixed_cost < gas_value and not future_better)),
+        "economic": price_available and (target_kw == 0 or (mixed_cost < gas_value and not should_defer)),
     }
 
 
@@ -841,8 +845,8 @@ def relay_mask_from_health(relay_health: Optional[dict]) -> tuple[bool, bool, bo
     return tuple(bool(parsed.get(f"phase{i}")) for i in (1, 2, 3))
 
 
-def best_future_solar_opportunity_today(forecast_doc: Optional[dict], now: datetime, cfg: Config) -> Optional[dict]:
-    candidates = []
+def future_solar_opportunities_today(forecast_doc: Optional[dict], now: datetime, cfg: Config) -> list[dict]:
+    opportunities: list[dict] = []
     for slot in (forecast_doc or {}).get("slots", []):
         try:
             start = parse_iso_datetime(str(slot.get("slot_start", "")), ZoneInfo(cfg.system.timezone))
@@ -851,23 +855,217 @@ def best_future_solar_opportunity_today(forecast_doc: Optional[dict], now: datet
         except (TypeError, ValueError):
             continue
         if start > now and start.date() == now.date() and surplus_kwh > 0.05:
-            candidates.append((opportunity, start, surplus_kwh))
-    if not candidates:
+            opportunities.append({
+                "slot_start": start.isoformat(),
+                "start": start,
+                "opportunity_cost_czk_kwh": opportunity,
+                "surplus_kwh": surplus_kwh,
+            })
+    return sorted(opportunities, key=lambda item: item["start"])
+
+
+def best_future_solar_opportunity_today(forecast_doc: Optional[dict], now: datetime, cfg: Config) -> Optional[dict]:
+    opportunities = future_solar_opportunities_today(forecast_doc, now, cfg)
+    if not opportunities:
         return None
-    opportunity, start, surplus_kwh = min(candidates, key=lambda item: item[0])
-    return {"slot_start": start.isoformat(), "opportunity_cost_czk_kwh": opportunity, "surplus_kwh": surplus_kwh}
+    best = min(opportunities, key=lambda item: item["opportunity_cost_czk_kwh"])
+    return {
+        "slot_start": best["slot_start"],
+        "opportunity_cost_czk_kwh": best["opportunity_cost_czk_kwh"],
+        "surplus_kwh": best["surplus_kwh"],
+    }
+
+
+def future_boiler_opportunities_today(
+    forecast_doc: Optional[dict], now: datetime, cfg: Config, *, target_kw: float
+) -> list[dict]:
+    opportunities: list[dict] = []
+    step_hours = max(1.0, float(cfg.system.planning_step_minutes)) / 60.0
+    for slot in (forecast_doc or {}).get("slots", []):
+        try:
+            start = parse_iso_datetime(str(slot.get("slot_start", "")), ZoneInfo(cfg.system.timezone))
+        except (TypeError, ValueError):
+            continue
+        if start <= now or start.date() != now.date() or target_kw <= 0:
+            continue
+        try:
+            surplus_kwh = max(0.0, float(slot.get("pv_estimate_kwh", 0.0) or 0.0) - float(slot.get("fixed_load_kwh", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            surplus_kwh = 0.0
+        spot_raw = slot.get("price_eur_mwh")
+        if spot_raw is not None:
+            try:
+                spot = float(spot_raw)
+            except (TypeError, ValueError):
+                continue
+            import_cost = economics.import_cost_czk_per_kwh(spot, cfg)
+            export_opportunity = economics.export_revenue_czk_per_kwh(spot, cfg)
+            surplus_kw = min(target_kw, surplus_kwh / step_hours)
+            import_kw = max(0.0, target_kw - surplus_kw)
+            mixed_cost = (surplus_kw * export_opportunity + import_kw * import_cost) / target_kw
+            capacity_kwh = target_kw * step_hours
+        elif surplus_kwh > 0.05 and slot.get("export_revenue_czk_kwh") is not None:
+            # Fallback for older/minimal forecast docs without price_eur_mwh.
+            mixed_cost = float(slot.get("export_revenue_czk_kwh", 0.0) or 0.0)
+            capacity_kwh = surplus_kwh
+            surplus_kw = min(target_kw, surplus_kwh / step_hours)
+            import_kw = max(0.0, target_kw - surplus_kw)
+        else:
+            continue
+        opportunities.append({
+            "slot_start": start.isoformat(),
+            "start": start,
+            "mixed_cost_czk_kwh": mixed_cost,
+            "capacity_kwh": capacity_kwh,
+            "surplus_kwh": surplus_kwh,
+            "surplus_covered_kw": surplus_kw,
+            "import_covered_kw": import_kw,
+        })
+    return sorted(opportunities, key=lambda item: item["start"])
+
+
+def best_future_boiler_opportunity_today(
+    forecast_doc: Optional[dict], now: datetime, cfg: Config, *, target_kw: float
+) -> Optional[dict]:
+    opportunities = future_boiler_opportunities_today(forecast_doc, now, cfg, target_kw=target_kw)
+    if not opportunities:
+        return None
+    best = min(opportunities, key=lambda item: item["mixed_cost_czk_kwh"])
+    return {
+        "slot_start": best["slot_start"],
+        "mixed_cost_czk_kwh": round(float(best["mixed_cost_czk_kwh"]), 6),
+        "capacity_kwh": round(float(best["capacity_kwh"]), 6),
+        "surplus_kwh": round(float(best["surplus_kwh"]), 6),
+    }
+
+
+def future_boiler_deferral_decision(
+    *, current_mixed_cost: float, current_import_cost: float, current_import_kw: float, target_kw: float, gas_value: float,
+    forecast_doc: Optional[dict], now: datetime, cfg: Config, remaining_need_kwh: Optional[float] = None,
+) -> dict:
+    future = best_future_solar_opportunity_today(forecast_doc, now, cfg)
+    future_boiler = best_future_boiler_opportunity_today(forecast_doc, now, cfg, target_kw=target_kw)
+    legacy_future_better = (
+        current_import_kw > 0 and future is not None
+        and future.get("opportunity_cost_czk_kwh") is not None
+        and float(future["opportunity_cost_czk_kwh"]) + 1e-9 < current_import_cost
+    )
+    base = {
+        "should_defer": False,
+        "reason": "no_future_opportunity",
+        "legacy_future_solar_better_for_import": legacy_future_better,
+        "best_future_solar_opportunity_today": future,
+        "best_future_boiler_opportunity_today": future_boiler,
+        "current_mixed_cost_czk_kwh": round(current_mixed_cost, 6),
+        "current_import_cost_czk_kwh": round(current_import_cost, 6),
+        "gas_heat_value_czk_kwh": round(gas_value, 6),
+        "current_import_kw": round(current_import_kw, 6),
+    }
+    if current_import_kw <= 0 or future_boiler is None:
+        return base
+    future_cost = float(future_boiler["mixed_cost_czk_kwh"])
+    delta = current_mixed_cost - future_cost
+    threshold = max(
+        float(cfg.boiler.future_better_min_delta_czk_kwh),
+        abs(current_mixed_cost) * float(cfg.boiler.future_better_min_delta_ratio),
+    )
+    base.update({
+        "reason": "future_delta_negligible",
+        "best_future_cost_czk_kwh": round(future_cost, 6),
+        "delta_czk_kwh": round(delta, 6),
+        "material_delta_threshold_czk_kwh": round(threshold, 6),
+    })
+    if delta < threshold:
+        return base
+
+    opportunities = future_boiler_opportunities_today(forecast_doc, now, cfg, target_kw=target_kw)
+    material = [
+        item for item in opportunities
+        if float(item["mixed_cost_czk_kwh"]) <= current_mixed_cost - threshold
+        and float(item["mixed_cost_czk_kwh"]) < gas_value
+    ]
+    planning_step_minutes = max(1.0, float(cfg.system.planning_step_minutes))
+    groups: list[list[dict]] = []
+    current_group: list[dict] = []
+    previous_start: Optional[datetime] = None
+    for item in material:
+        start = item["start"]
+        if previous_start is None or (start - previous_start).total_seconds() <= planning_step_minutes * 60.0 + 1.0:
+            current_group.append(item)
+        else:
+            if current_group:
+                groups.append(current_group)
+            current_group = [item]
+        previous_start = start
+    if current_group:
+        groups.append(current_group)
+
+    def group_stats(group: list[dict]) -> dict:
+        start = group[0]["start"]
+        end = group[-1]["start"] + timedelta(minutes=planning_step_minutes)
+        return {
+            "start": start,
+            "end": end,
+            "duration_minutes": (end - start).total_seconds() / 60.0,
+            "capacity_kwh": sum(float(item["capacity_kwh"]) for item in group),
+            "surplus_kwh": sum(float(item["surplus_kwh"]) for item in group),
+            "min_cost_czk_kwh": min(float(item["mixed_cost_czk_kwh"]) for item in group),
+            "avg_cost_czk_kwh": sum(float(item["mixed_cost_czk_kwh"]) for item in group) / len(group),
+        }
+
+    best_group = max((group_stats(group) for group in groups), key=lambda x: (x["capacity_kwh"], x["duration_minutes"]), default=None)
+    if best_group is None:
+        base["reason"] = "no_material_future_window"
+        return base
+    remaining = (
+        float(remaining_need_kwh)
+        if remaining_need_kwh is not None
+        else max(float(cfg.boiler.opportunistic_daily_limit_kwh), 0.0)
+    )
+    long_enough = best_group["duration_minutes"] >= float(cfg.boiler.future_better_min_duration_minutes)
+    base.update({
+        "best_window_start": best_group["start"].isoformat(),
+        "best_window_end": best_group["end"].isoformat(),
+        "best_window_duration_minutes": round(best_group["duration_minutes"], 3),
+        "best_window_capacity_kwh": round(best_group["capacity_kwh"], 6),
+        "best_window_surplus_kwh": round(best_group["surplus_kwh"], 6),
+        "best_window_min_cost_czk_kwh": round(best_group["min_cost_czk_kwh"], 6),
+        "best_window_avg_cost_czk_kwh": round(best_group["avg_cost_czk_kwh"], 6),
+    })
+    if long_enough:
+        if current_mixed_cost <= gas_value - float(cfg.boiler.max_wait_if_current_mixed_below_gas_czk_kwh):
+            base["reason"] = "current_materially_below_gas_progress"
+            return base
+        base["should_defer"] = True
+        base["reason"] = "long_material_future_window"
+        return base
+
+    reserve_kwh = min(
+        max(0.0, remaining) * float(cfg.boiler.future_price_spike_reserve_fraction),
+        float(cfg.boiler.future_price_spike_max_reserve_kwh),
+        best_group["capacity_kwh"],
+    )
+    base["short_spike_reserve_kwh"] = round(reserve_kwh, 6)
+    if remaining > reserve_kwh and current_mixed_cost < gas_value:
+        base["reason"] = "prefill_before_short_future_window"
+        return base
+    base["should_defer"] = True
+    base["reason"] = "reserve_for_short_future_window"
+    return base
 
 
 def economic_boiler_candidates(
     *, slot: Optional[dict], forecast_doc: Optional[dict], now: datetime, cfg: Config, telemetry_evidence: dict,
+    ledger: Optional[dict] = None,
 ) -> dict:
     gas_value = economics.gas_heat_value_czk_per_kwh(cfg)
     spot = float((slot or {}).get("price_eur_mwh", 0.0) or 0.0)
     import_cost = economics.import_cost_czk_per_kwh(spot, cfg)
     export_opportunity = economics.export_revenue_czk_per_kwh(spot, cfg)
     pre_surplus = max(0.0, float(telemetry_evidence.get("reconstructed_pre_boiler_surplus_kw", 0.0) or 0.0))
-    future = best_future_solar_opportunity_today(forecast_doc, now, cfg)
-    future_cost = future.get("opportunity_cost_czk_kwh") if future else None
+    today = boiler_state.today_entry(boiler_state.normalize_state(ledger or {}), now.date())
+    delivered_today_kwh = max(0.0, float(today.get("estimated_delivered_kwh", 0.0) or 0.0))
+    remaining_need_kwh = max(0.0, float(cfg.boiler.opportunistic_daily_limit_kwh) - delivered_today_kwh)
     rows = []
     best = 0
     for phases in range(cfg.boiler.phase_count + 1):
@@ -875,12 +1073,18 @@ def economic_boiler_candidates(
         surplus_kw = min(target_kw, pre_surplus)
         import_kw = max(0.0, target_kw - surplus_kw)
         mixed_cost = 0.0 if target_kw == 0 else (surplus_kw * export_opportunity + import_kw * import_cost) / target_kw
-        future_better = import_kw > 0 and future_cost is not None and future_cost + 1e-9 < import_cost
-        economic = target_kw == 0 or (mixed_cost < gas_value and not future_better)
+        future_deferral = future_boiler_deferral_decision(
+            current_mixed_cost=mixed_cost, current_import_cost=import_cost, current_import_kw=import_kw, target_kw=target_kw,
+            gas_value=gas_value, forecast_doc=forecast_doc, now=now, cfg=cfg, remaining_need_kwh=remaining_need_kwh,
+        )
+        future_better = bool(future_deferral.get("legacy_future_solar_better_for_import"))
+        should_defer = bool(future_deferral.get("should_defer"))
+        economic = target_kw == 0 or (mixed_cost < gas_value and not should_defer)
         rows.append({
             "phases": phases, "target_kw": target_kw, "surplus_covered_kw": round(surplus_kw, 6),
             "import_covered_kw": round(import_kw, 6), "mixed_cost_czk_kwh": round(mixed_cost, 6),
             "economic": economic, "future_solar_better_for_import": future_better,
+            "future_deferral": future_deferral,
         })
         if economic:
             best = phases
@@ -889,7 +1093,9 @@ def economic_boiler_candidates(
         "gas_heat_value_czk_kwh": round(gas_value, 6),
         "import_cost_czk_kwh": round(import_cost, 6),
         "export_opportunity_czk_kwh": round(export_opportunity, 6),
-        "best_future_solar_opportunity_today": future,
+        "delivered_today_kwh": round(delivered_today_kwh, 6),
+        "remaining_need_kwh": round(remaining_need_kwh, 6),
+        "best_future_solar_opportunity_today": best_future_solar_opportunity_today(forecast_doc, now, cfg),
         "candidates": rows,
     }
 
@@ -1029,7 +1235,7 @@ def decide_boiler_execution(
         }
     hard_active = float((slot or {}).get("boiler_hard_kwh", 0.0) or 0.0) > 1e-6
     economics_result = economic_boiler_candidates(
-        slot=slot, forecast_doc=forecast_doc, now=now, cfg=cfg, telemetry_evidence=telemetry_evidence,
+        slot=slot, forecast_doc=forecast_doc, now=now, cfg=cfg, telemetry_evidence=telemetry_evidence, ledger=ledger,
     )
     realtime = economics_result["target_phases"]
     requested = max(planned if hard_active else 0, realtime)

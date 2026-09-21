@@ -151,6 +151,12 @@ class BoilerConfig:
     curtailment_probe_import_tolerance_kw: float
     curtailment_probe_battery_discharge_tolerance_kw: float
     curtailment_probe_min_pv_response_kw: float
+    future_better_min_delta_czk_kwh: float
+    future_better_min_delta_ratio: float
+    future_better_min_duration_minutes: float
+    future_price_spike_reserve_fraction: float
+    future_price_spike_max_reserve_kwh: float
+    max_wait_if_current_mixed_below_gas_czk_kwh: float
 
 
 @dataclass(frozen=True)
@@ -425,6 +431,18 @@ def _validate_and_build(raw: dict) -> tuple[Config | None, list[str]]:
             "curtailment_probe_battery_discharge_tolerance_kw", (int, float), min_value=0) or 0.0,
         curtailment_probe_min_pv_response_kw=v.get(
             "curtailment_probe_min_pv_response_kw", (int, float), min_value=0) or 0.0,
+        future_better_min_delta_czk_kwh=v.get(
+            "future_better_min_delta_czk_kwh", (int, float), min_value=0) or 0.25,
+        future_better_min_delta_ratio=v.get(
+            "future_better_min_delta_ratio", (int, float), min_value=0) or 0.15,
+        future_better_min_duration_minutes=v.get(
+            "future_better_min_duration_minutes", (int, float), min_value=0) or 180.0,
+        future_price_spike_reserve_fraction=v.get(
+            "future_price_spike_reserve_fraction", (int, float), min_value=0, max_value=1) or 0.50,
+        future_price_spike_max_reserve_kwh=v.get(
+            "future_price_spike_max_reserve_kwh", (int, float), min_value=0) or 4.0,
+        max_wait_if_current_mixed_below_gas_czk_kwh=v.get(
+            "max_wait_if_current_mixed_below_gas_czk_kwh", (int, float), min_value=0) or 0.30,
     )
     for k in v.unknown_keys():
         errors.append(f"[boiler.{k}] neznámý klíč")
