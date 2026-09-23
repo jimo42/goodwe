@@ -1,4 +1,6 @@
 # Secrets and local machine configuration
+conf/
+config/
 config.toml
 **/config.toml
 .env
@@ -50,6 +52,7 @@ analysis_results/
 *.xls
 *.tar
 *.tar.gz
+*.tgz
 *.zip
 
 # Python/cache/build artifacts
