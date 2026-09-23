@@ -420,6 +420,42 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     )
 
 
+def test_planned_load_watch_uses_current_active_window_when_rescheduled_backward():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    now = datetime(2026, 9, 23, 12, 8, tzinfo=tz)
+    slots = [
+        {
+            "slot_start": "2026-09-23T12:00:00+02:00",
+            "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+            "additional_load_kwh": 0.0,
+        },
+        {
+            "slot_start": "2026-09-23T12:15:00+02:00",
+            "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+            "additional_load_kwh": 0.0,
+        },
+    ]
+    detected = {
+        "ev": {"detected_kw": 0.0},
+        "planned_load_watch": {
+            "ev": {"state": "waiting", "planned_start": "2026-09-23T12:15:00+02:00"}
+        },
+    }
+
+    out = executor.update_planned_load_watch(
+        detected,
+        forecast_doc={"slots": slots},
+        current_slot=slots[0],
+        now=now,
+        cfg=cfg,
+    )
+
+    ev_watch = out["planned_load_watch"]["ev"]
+    assert ev_watch["planned_start"] == "2026-09-23T12:00:00+02:00"
+    assert ev_watch["alert_due_at"] == "2026-09-23T12:15:00+02:00"
+
+
 def test_planned_load_watch_alerts_after_later_rescheduled_ev_start():
     cfg = _cfg()
     tz = ZoneInfo(cfg.system.timezone)
@@ -613,6 +649,78 @@ def test_planned_load_watch_carries_observed_ev_session_across_idle_gap():
     assert ev_watch["undetected_since"] == "2026-09-15T15:18:00+02:00"
     assert ev_watch["alert_due_at"] == "2026-09-15T15:33:00+02:00"
     assert ev_watch["missing"] is False
+
+
+def test_planned_load_watch_ignores_old_closed_ev_session_for_new_request():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    slot = {
+        "slot_start": "2026-09-23T12:00:00+02:00",
+        "ev_load_kwh": cfg.ev.planning_power_kw * cfg.system.planning_step_minutes / 60.0,
+        "additional_load_kwh": 0.0,
+    }
+    forecast = {
+        "active_requests": [{
+            "id": "new-request",
+            "type": "ev_charge",
+            "required_ac_kwh": 8.0,
+            "delivered_kwh": 0.0,
+            "request_remaining_kwh": 8.0,
+        }],
+        "ev_charging_session": {
+            "request_id": "old-request",
+            "session_id": "old-session",
+            "state": "CLOSED",
+            "started_at": "2026-09-21T09:00:00+02:00",
+            "last_active_at": "2026-09-21T11:00:00+02:00",
+            "effective_target_kwh": 8.0,
+            "delivered_kwh": 8.0,
+            "request_remaining_kwh": 0.0,
+            "request_credited_kwh": 8.0,
+        },
+        "slots": [slot],
+    }
+    detected = {"ev": {"detected_kw": 0.0}, "planned_load_watch": {}}
+
+    first = executor.update_planned_load_watch(
+        detected,
+        forecast_doc=forecast,
+        current_slot=slot,
+        now=datetime(2026, 9, 23, 12, 8, tzinfo=tz),
+        cfg=cfg,
+    )
+    first_watch = first["planned_load_watch"]["ev"]
+    assert first_watch["request_id"] == "new-request"
+    assert first_watch["request_complete"] is False
+    assert first_watch["ever_detected"] is False
+    assert first_watch["undetected_since"] == "2026-09-23T12:00:00+02:00"
+    assert first_watch["alert_due_at"] == "2026-09-23T12:15:00+02:00"
+    assert first_watch["missing"] is False
+
+    second = executor.update_planned_load_watch(
+        first,
+        forecast_doc=forecast,
+        current_slot=slot,
+        now=datetime(2026, 9, 23, 12, 13, tzinfo=tz),
+        cfg=cfg,
+    )
+    second_watch = second["planned_load_watch"]["ev"]
+    assert second_watch["ever_detected"] is False
+    assert second_watch["undetected_since"] == "2026-09-23T12:00:00+02:00"
+    assert second_watch["alert_due_at"] == "2026-09-23T12:15:00+02:00"
+    assert second_watch["missing"] is False
+
+    third = executor.update_planned_load_watch(
+        second,
+        forecast_doc=forecast,
+        current_slot=slot,
+        now=datetime(2026, 9, 23, 12, 16, tzinfo=tz),
+        cfg=cfg,
+    )
+    third_watch = third["planned_load_watch"]["ev"]
+    assert third_watch["ever_detected"] is False
+    assert third_watch["alert_due_at"] == "2026-09-23T12:15:00+02:00"
+    assert third_watch["missing"] is True
 
 
 def test_planned_load_watch_ignores_detector_only_additional_load_projection():

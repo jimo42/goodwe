@@ -714,6 +714,15 @@ def choose_requests(
             required = 0.0 if closure_tolerated or mostly_completed_by_active_session else raw_remaining
             deadline = req["deadline"]
             available_from = req.get("available_from") or starts[0]
+            if now is not None and starts:
+                # Re-plans must not create a new EV window that starts in the
+                # past relative to the planner run. The executor only watches
+                # current/future slots, so anchoring here prevents misleading
+                # retroactive starts such as 12:00 from a 12:07 planner run.
+                available_from = max(
+                    available_from,
+                    min(starts[-1], round_up_to_slot(now, cfg.system.planning_step_minutes)),
+                )
         except (KeyError, TypeError, ValueError):
             active_summary.append({"type": rtype, "status": "invalid"})
         else:

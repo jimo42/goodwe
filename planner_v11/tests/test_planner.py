@@ -390,6 +390,49 @@ def test_boiler_daily_budget_uses_delivered_today_and_full_future_limit():
     assert diagnostics["2026-08-02"]["estimated_delivered_before_plan_kwh"] == 4.5
 
 
+def test_choose_requests_never_recommends_ev_start_in_past_for_replan():
+    cfg = _cfg({"system": {"horizon_hours": 3}})
+    now = datetime(2026, 9, 23, 12, 7)
+    start = datetime(2026, 9, 23, 12, 0)
+    starts = [start + timedelta(minutes=15 * i) for i in range(12)]
+    opt_slots = [
+        optimizer.SlotInput(
+            slot_start=slot_start,
+            price_import_czk_kwh=1.0,
+            price_export_czk_kwh=0.0,
+            export_allowed=True,
+            effective_import_nonpositive=False,
+            pv_kwh=0.0,
+            fixed_load_kwh=0.1,
+        )
+        for slot_start in starts
+    ]
+    requests = [{
+        "id": "ev-replan",
+        "type": "ev_charge",
+        "status": "active",
+        "available_from": start,
+        "deadline": start + timedelta(hours=3),
+        "required_ac_kwh": cfg.ev.planning_power_kw * 0.5,
+    }]
+
+    ev_req, _, summary = planner.choose_requests(
+        requests,
+        starts,
+        cfg,
+        opt_slots,
+        initial_soc_kwh=7.4,
+        terminal_value_czk_per_kwh=0.0,
+        now=now,
+    )
+
+    assert ev_req is not None
+    recommended_start = summary[0]["recommendation"]["recommended_start"]
+    assert recommended_start is not None
+    assert datetime.fromisoformat(recommended_start) >= planner.round_up_to_slot(now, cfg.system.planning_step_minutes)
+    assert ev_req.window_start_idx >= starts.index(planner.round_up_to_slot(now, cfg.system.planning_step_minutes))
+
+
 def test_choose_requests_defers_far_ev_deadline_without_pv_rich_candidate():
     cfg = _cfg({"system": {"horizon_hours": 2}})
     start = datetime(2026, 7, 24, 12, 0)

@@ -1504,21 +1504,39 @@ def _ev_watch_context(forecast_doc: Optional[dict]) -> dict[str, Any]:
                 active_request = item
                 break
 
-    request_id = (
-        session.get("request_id")
-        or active_request.get("id")
-        or active_request.get("request_id")
+    active_request_id = active_request.get("id") or active_request.get("request_id")
+    session_request_id = session.get("request_id")
+    request_id = active_request_id or session_request_id
+    session_matches_active_request = bool(
+        active_request_id
+        and session_request_id
+        and str(session_request_id) == str(active_request_id)
     )
-    required_kwh = _watch_float(active_request.get("required_ac_kwh"))
-    if required_kwh is None:
-        required_kwh = _watch_float(session.get("effective_target_kwh"))
-    delivered_kwh = _watch_float(active_request.get("delivered_kwh"))
-    if delivered_kwh is None:
-        delivered_kwh = _watch_float(session.get("delivered_kwh"))
-    request_remaining_kwh = _watch_float(active_request.get("request_remaining_kwh"))
-    if request_remaining_kwh is None:
-        request_remaining_kwh = _watch_float(session.get("request_remaining_kwh"))
-    request_credited_kwh = _watch_float(session.get("request_credited_kwh"))
+    has_active_request = bool(active_request_id)
+    active_required_kwh = _watch_float(active_request.get("required_ac_kwh"))
+    session_required_kwh = _watch_float(session.get("effective_target_kwh"))
+    active_delivered_kwh = _watch_float(active_request.get("delivered_kwh"))
+    session_delivered_kwh = _watch_float(session.get("delivered_kwh"))
+    active_remaining_kwh = _watch_float(active_request.get("request_remaining_kwh"))
+    session_remaining_kwh = _watch_float(session.get("request_remaining_kwh"))
+    session_credited_kwh = _watch_float(session.get("request_credited_kwh"))
+
+    if has_active_request:
+        required_kwh = active_required_kwh if active_required_kwh is not None else (
+            session_required_kwh if session_matches_active_request else None
+        )
+        delivered_kwh = active_delivered_kwh if active_delivered_kwh is not None else (
+            session_delivered_kwh if session_matches_active_request else None
+        )
+        request_remaining_kwh = active_remaining_kwh if active_remaining_kwh is not None else (
+            session_remaining_kwh if session_matches_active_request else None
+        )
+        request_credited_kwh = session_credited_kwh if session_matches_active_request else None
+    else:
+        required_kwh = session_required_kwh
+        delivered_kwh = session_delivered_kwh
+        request_remaining_kwh = session_remaining_kwh
+        request_credited_kwh = session_credited_kwh
 
     request_complete = False
     if request_remaining_kwh is not None and request_remaining_kwh <= 0.05:
@@ -1529,13 +1547,24 @@ def _ev_watch_context(forecast_doc: Optional[dict]) -> dict[str, Any]:
         if request_credited_kwh is not None and request_credited_kwh >= max(0.0, required_kwh - 0.05):
             request_complete = True
 
-    observed = bool(session.get("started_at") or session.get("last_active_at"))
-    if delivered_kwh is not None and delivered_kwh > 0.05:
-        observed = True
+    session_observed = bool(session.get("started_at") or session.get("last_active_at"))
+    if session_delivered_kwh is not None and session_delivered_kwh > 0.05:
+        session_observed = True
+    active_request_observed = delivered_kwh is not None and delivered_kwh > 0.05
+    if has_active_request:
+        # A historical/closed EV session must not make a new active request look
+        # previously observed. Only a session explicitly tied to this request, or
+        # delivered energy reported on the active request itself, counts.
+        observed = bool(active_request_observed or (session_matches_active_request and session_observed))
+    else:
+        observed = bool(session_observed)
 
     return {
         "request_id": str(request_id) if request_id else None,
+        "active_request_id": str(active_request_id) if active_request_id else None,
+        "session_request_id": str(session_request_id) if session_request_id else None,
         "session_id": session.get("session_id") or active_request.get("session_id"),
+        "session_matches_active_request": session_matches_active_request,
         "request_complete": request_complete,
         "observed": observed,
         "started_at": session.get("started_at"),
@@ -1684,9 +1713,7 @@ def update_planned_load_watch(
             current_start = _forecast_active_window_start(forecast_doc, now=now, kind=kind, cfg=cfg)
             if current_start is None:
                 current_start = _parse_watch_datetime((current_slot or {}).get("slot_start"), now)
-            prior_start = _parse_watch_datetime(prior.get("planned_start"), now)
-            candidates = [value for value in (current_start, prior_start) if value is not None]
-            planned_start = max(candidates) if candidates else now
+            planned_start = current_start or _parse_watch_datetime(prior.get("planned_start"), now) or now
         elif prior.get("state") == "waiting":
             prior_start = _parse_watch_datetime(prior.get("planned_start"), now)
             next_start = _forecast_planned_start(forecast_doc, now=now, kind=kind, cfg=cfg)
@@ -1710,7 +1737,17 @@ def update_planned_load_watch(
             watch[kind] = {"state": "idle", "planned_start": None, "alert_due_at": None, "alert_key": None}
             continue
 
-        prior_ever_detected = bool(prior.get("ever_detected") or prior.get("state") == "detected")
+        prior_matches_current_ev_request = True
+        if kind == "ev":
+            current_request_id = ev_context.get("request_id")
+            prior_request_id = prior.get("request_id")
+            if current_request_id or prior_request_id:
+                prior_matches_current_ev_request = bool(
+                    current_request_id and prior_request_id and str(current_request_id) == str(prior_request_id)
+                )
+        prior_ever_detected = prior_matches_current_ev_request and bool(
+            prior.get("ever_detected") or prior.get("state") == "detected"
+        )
         if kind == "ev" and ev_context.get("observed"):
             prior_ever_detected = True
         ever_detected = prior_ever_detected or detected
