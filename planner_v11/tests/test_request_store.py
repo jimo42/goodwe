@@ -251,3 +251,69 @@ def test_ev_schedule_notification_rejects_non_active_or_other_request():
             assert result.reason == "active_ev_not_found"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_complete_request_marks_active_ev_completed_and_removes_from_active_list():
+    tmp = _tmpdir()
+    try:
+        path = Path(tmp) / "requests.json"
+        request_store.store_request(
+            path,
+            {
+                "id": "ev-1",
+                "request_id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 8.0,
+                "deadline": "2026-09-24T09:00:00+02:00",
+            },
+            replace_existing_same_type=True,
+        )
+        now = datetime(2026, 9, 23, 16, 38, tzinfo=ZoneInfo("Europe/Prague"))
+        result = request_store.complete_request(
+            path,
+            "ev-1",
+            now=now,
+            completed_kwh=8.24,
+            session_id="ev-session",
+            reason="test_completion",
+        )
+        doc = _read(path)
+        item = doc["requests"][0]
+        active = request_store.active_requests(path, now=now)
+        assert result.completed is True
+        assert item["status"] == "completed"
+        assert item["completed_at"] == "2026-09-23T16:38:00+02:00"
+        assert item["completed_kwh"] == 8.24
+        assert item["completed_by_session_id"] == "ev-session"
+        assert item["completion_reason"] == "test_completion"
+        assert active == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_complete_request_does_not_resurrect_expired_request():
+    tmp = _tmpdir()
+    try:
+        path = Path(tmp) / "requests.json"
+        path.write_text(json.dumps({"requests": [{
+            "id": "ev-1",
+            "request_id": "ev-1",
+            "type": "ev_charge",
+            "status": "expired",
+            "expired_at": "2026-09-24T09:03:00+02:00",
+        }]}), encoding="utf-8")
+        result = request_store.complete_request(
+            path,
+            "ev-1",
+            now=datetime(2026, 9, 24, 10, 0, tzinfo=ZoneInfo("Europe/Prague")),
+            completed_kwh=8.2,
+            session_id="ev-session",
+        )
+        item = _read(path)["requests"][0]
+        assert result.completed is False
+        assert result.reason == "not_active:expired"
+        assert item["status"] == "expired"
+        assert "completed_at" not in item
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

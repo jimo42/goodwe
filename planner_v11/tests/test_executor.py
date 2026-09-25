@@ -25,6 +25,12 @@ spec.loader.exec_module(executor)
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.toml")
 
 
+def json_load(path: Path):
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _cfg(overrides: dict | None = None):
     with open(CONFIG_PATH, "rb") as f:
         raw = tomllib.load(f)
@@ -1002,3 +1008,86 @@ def test_executor_preserves_existing_ev_completion_notification_timestamp():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+def test_persist_ev_completion_notification_marks_matching_request_completed():
+    now = datetime(2026, 9, 23, 16, 38, tzinfo=ZoneInfo("Europe/Prague"))
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_executor_ev_complete_request_"))
+    try:
+        session_path = tmp / "ev_session.json"
+        requests_path = tmp / "requests.json"
+        executor.ev_session.write_state(session_path, {
+            "session_id": "ev-session",
+            "state": "CLOSED",
+            "request_id": "ev-1",
+            "effective_target_kwh": 8.0,
+            "delivered_kwh": 8.2,
+        })
+        executor.request_store.store_request(
+            requests_path,
+            {
+                "id": "ev-1",
+                "request_id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 8.0,
+                "deadline": "2026-09-24T09:00:00+02:00",
+            },
+            replace_existing_same_type=True,
+        )
+        session_state = executor.ev_session.read_state(session_path)
+
+        persisted = executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": True, "key": "executor.ev_session_completed.ev-session"}],
+            session_state=session_state,
+            ev_session_path=session_path,
+            requests_path=requests_path,
+            now=now,
+        )
+        request = json_load(requests_path)["requests"][0]
+        assert persisted["completion_notification_sent_at"] == "2026-09-23T16:38:00+02:00"
+        assert request["status"] == "completed"
+        assert request["completed_kwh"] == 8.2
+        assert request["completed_by_session_id"] == "ev-session"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_persist_ev_completion_notification_does_not_complete_shortfall_request():
+    now = datetime(2026, 9, 24, 3, 13, tzinfo=ZoneInfo("Europe/Prague"))
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_executor_ev_shortfall_request_"))
+    try:
+        session_path = tmp / "ev_session.json"
+        requests_path = tmp / "requests.json"
+        executor.ev_session.write_state(session_path, {
+            "session_id": "ev-session",
+            "state": "CLOSED",
+            "request_id": "ev-1",
+            "effective_target_kwh": 8.0,
+            "delivered_kwh": 0.01,
+        })
+        executor.request_store.store_request(
+            requests_path,
+            {
+                "id": "ev-1",
+                "request_id": "ev-1",
+                "type": "ev_charge",
+                "status": "active",
+                "required_ac_kwh": 8.0,
+                "deadline": "2026-09-24T09:00:00+02:00",
+            },
+            replace_existing_same_type=True,
+        )
+        session_state = executor.ev_session.read_state(session_path)
+
+        executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": True, "key": "executor.ev_session_completed.ev-session"}],
+            session_state=session_state,
+            ev_session_path=session_path,
+            requests_path=requests_path,
+            now=now,
+        )
+        request = json_load(requests_path)["requests"][0]
+        assert request["status"] == "active"
+        assert "completed_at" not in request
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

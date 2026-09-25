@@ -1318,3 +1318,34 @@ def test_build_forecast_document_marks_disabled_battery_without_soc_percentages(
     assert doc["slots"][0]["battery_action"] == "DISABLED"
     assert doc["slots"][0]["battery_power_kw"] == 0.0
 
+
+def test_load_active_requests_ignores_completed_ev_request():
+    tmp = tempfile.mkdtemp(prefix="planner_v11_completed_request_")
+    try:
+        path = Path(tmp) / "requests.json"
+        path.write_text(json.dumps({"requests": [
+            {
+                "id": "ev-completed",
+                "request_id": "ev-completed",
+                "type": "ev_charge",
+                "status": "completed",
+                "required_ac_kwh": 8.0,
+                "deadline": "2026-09-24T09:00:00+02:00",
+                "completed_at": "2026-09-23T16:38:00+02:00",
+            },
+            {
+                "id": "load-active",
+                "request_id": "load-active",
+                "type": "additional_load",
+                "status": "active",
+                "power_kw": 1.0,
+                "start": "2026-09-24T10:00:00+02:00",
+                "end": "2026-09-24T11:00:00+02:00",
+            },
+        ]}), encoding="utf-8")
+
+        active = planner.load_active_requests(path)
+
+        assert [item["id"] for item in active] == ["load-active"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

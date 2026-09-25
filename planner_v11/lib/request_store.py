@@ -1,8 +1,10 @@
 """Atomic storage helpers for planner_v10 user requests.
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 Changelog:
+- v1.4 (2026-09-25): Add idempotent completion metadata for fulfilled EV
+  requests so completed charging is no longer replanned.
 - v1.3 (2026-08-04): Serialize request-store mutations with a file lock and add
   compare-and-set EV schedule notification metadata updates.
 - v1.2 (2026-07-27): Expire requests whose deadline/end has passed before
@@ -31,7 +33,7 @@ except ImportError:  # pragma: no cover - local Windows test compatibility.
     fcntl = None
 
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,15 @@ class EvScheduleNotificationResult:
 class ActiveEvScheduleNotification:
     request_id: str
     last_notified_start: str
+
+
+@dataclass(frozen=True)
+class CompleteResult:
+    """Result of marking one active request completed."""
+
+    completed: bool
+    request_id: str
+    reason: str
 
 
 def utc_now_iso() -> str:
@@ -160,6 +171,50 @@ def _parse_datetime(value: Any, now: datetime) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=now.tzinfo)
     return parsed.astimezone(now.tzinfo)
+
+
+def complete_request(
+    path: Path,
+    request_id: str,
+    *,
+    now: datetime | None = None,
+    completed_kwh: float | None = None,
+    session_id: str | None = None,
+    reason: str | None = None,
+) -> CompleteResult:
+    """Atomically mark one active request as completed.
+
+    The mutation is deliberately idempotent: already-completed requests remain
+    completed, while expired/replaced/cancelled requests are not resurrected.
+    """
+
+    request_id = str(request_id or "")
+    if not request_id:
+        return CompleteResult(False, request_id, "missing_request_id")
+    stamp = (now or datetime.now().astimezone()).isoformat(timespec="seconds")
+    with request_store_lock(path):
+        doc = read_request_document(path)
+        for item in doc["requests"]:
+            if request_id not in _request_identity(item):
+                continue
+            status = str(item.get("status", "active") or "active")
+            if status == "completed":
+                return CompleteResult(False, request_id, "already_completed")
+            if status != "active":
+                return CompleteResult(False, request_id, f"not_active:{status}")
+            item["status"] = "completed"
+            item["completed_at"] = stamp
+            if completed_kwh is not None:
+                item["completed_kwh"] = round(max(0.0, float(completed_kwh)), 3)
+            if session_id:
+                item["completed_by_session_id"] = str(session_id)
+            if reason:
+                item["completion_reason"] = str(reason)
+            doc["schema_version"] = 10
+            doc["updated_at"] = stamp
+            atomic_write_json(path, doc)
+            return CompleteResult(True, request_id, "completed")
+    return CompleteResult(False, request_id, "not_found")
 
 
 def request_is_expired(item: dict[str, Any], *, now: datetime) -> bool:

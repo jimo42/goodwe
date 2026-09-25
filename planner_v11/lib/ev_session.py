@@ -1,8 +1,10 @@
 """Persistent physical EV charging-session state machine.
 
-VERSION = "1.1"
+VERSION = "1.3"
 
 Changelog:
+- v1.3 (2026-09-25): Do not bootstrap new EV sessions from below-threshold
+  wallbox power samples; completed requests are persisted separately.
 - v1.2 (2026-09-04): Request a replan on every EV session close; executor may
   skip starting it only when a regular planner run is already near.
 - v1.1 (2026-08-10): Add a session-identity guarded persistence helper for
@@ -23,7 +25,7 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.2"
+VERSION = "1.3"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
@@ -268,11 +270,6 @@ def update_session(
     if old_state == "CLOSED":
         if is_active:
             return _start_session(now=now, wallbox=wallbox, active_ev_request=active_ev_request)
-        previous_raw = max(0.0, _float(old.get("wallbox_counter_raw_kwh")))
-        if counter_kwh > 0.0 and counter_kwh + 0.05 < previous_raw:
-            return _start_paused_session(
-                now=now, wallbox=wallbox, active_ev_request=active_ev_request
-            )
         state = dict(old)
         state["measurement_available"] = True
         state["measurement_source"] = "wallbox_api"
@@ -283,10 +280,9 @@ def update_session(
     if old_state == "IDLE":
         if is_active:
             return _start_session(now=now, wallbox=wallbox, active_ev_request=active_ev_request)
-        if counter_kwh > 0.0:
-            return _start_paused_session(
-                now=now, wallbox=wallbox, active_ev_request=active_ev_request
-            )
+        # A non-zero wallbox counter with below-threshold power can be stale or
+        # residual API state. Do not bootstrap a new PAUSED session from it; wait
+        # for an above-threshold sample to prove that charging really started.
         return idle_state(now, wallbox)
 
     state = dict(old)

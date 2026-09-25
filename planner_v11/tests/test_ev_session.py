@@ -48,15 +48,25 @@ def test_synthetic_session_uses_direct_counter_and_six_kwh_target():
     assert state["physical_remaining_to_max_kwh"] == 2.11
 
 
-def test_first_low_power_sample_with_counter_bootstraps_paused_session():
+def test_first_low_power_sample_with_counter_does_not_bootstrap_session():
     now = datetime(2026, 8, 7, 18, 0, tzinfo=TZ)
     request = {"id": "ev-1", "required_ac_kwh": 8.0}
     state = ev_session.update_session({}, now=now, wallbox=_wallbox(6, 7.9), active_ev_request=request)
-    assert state["state"] == "PAUSED"
-    assert state["request_id"] == "ev-1"
-    assert state["delivered_kwh"] == 7.9
-    assert state["bootstrap_from_low_power"] is True
-    assert state["replan_reason"] == "EV_SESSION_DISCOVERED_PAUSED"
+    assert state["state"] == "IDLE"
+    assert state["current_power_w"] == 6
+    assert "request_id" not in state
+    assert not state.get("bootstrap_from_low_power")
+    assert state["replan_required"] is False
+
+
+def test_low_power_request_waits_for_above_threshold_sample_to_start_session():
+    start = datetime(2026, 8, 7, 18, 0, tzinfo=TZ)
+    request = {"id": "ev-1", "required_ac_kwh": 8.0}
+    idle = ev_session.update_session({}, now=start, wallbox=_wallbox(6, 0.01), active_ev_request=request)
+    active = ev_session.update_session(idle, now=start + timedelta(minutes=5), wallbox=_wallbox(3060, 0.2), active_ev_request=request)
+    assert active["state"] == "ACTIVE"
+    assert active["request_id"] == "ev-1"
+    assert active["delivered_kwh"] == 0.2
 
 
 def test_user_target_is_capped_and_original_is_audited():

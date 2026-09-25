@@ -2050,14 +2050,35 @@ def send_executor_alerts(
     return outcomes
 
 
+def _ev_session_completed_request_id(session_state: dict) -> str | None:
+    """Return request id only when a closed session satisfies its bound request."""
+
+    if not isinstance(session_state, dict) or session_state.get("state") != "CLOSED":
+        return None
+    request_id = session_state.get("request_id")
+    if not request_id or str(request_id).startswith("synthetic:"):
+        return None
+    try:
+        delivered = float(session_state.get("delivered_kwh", 0.0) or 0.0)
+        target = float(session_state.get("effective_target_kwh", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if target <= 0.0:
+        return None
+    if delivered >= max(0.0, target - 0.05):
+        return str(request_id)
+    return None
+
+
 def persist_ev_completion_notification_if_sent(
     *,
     alerts: list[dict],
     session_state: dict,
     ev_session_path: Path,
     now: datetime,
+    requests_path: Path = REQUESTS_PATH,
 ) -> dict:
-    """Persist EV completion notification time only for a newly sent completion alert."""
+    """Persist EV completion notification time and complete the matching request."""
 
     completion_alert_sent = any(
         isinstance(outcome, dict)
@@ -2066,6 +2087,16 @@ def persist_ev_completion_notification_if_sent(
         for outcome in alerts
     )
     if completion_alert_sent and session_state.get("session_id"):
+        request_id = _ev_session_completed_request_id(session_state)
+        if request_id:
+            request_store.complete_request(
+                requests_path,
+                request_id,
+                now=now,
+                completed_kwh=float(session_state.get("delivered_kwh", 0.0) or 0.0),
+                session_id=str(session_state["session_id"]),
+                reason="ev_session_completion_notification_sent",
+            )
         return ev_session.mark_completion_notification_sent(
             ev_session_path,
             session_id=str(session_state["session_id"]),
@@ -2265,6 +2296,7 @@ def run_executor(
         session_state=session_state,
         ev_session_path=ev_session_path,
         now=now,
+        requests_path=requests_path,
     )
     runtime["ev_charging_session"] = session_state
     runtime["alerts"] = alerts
