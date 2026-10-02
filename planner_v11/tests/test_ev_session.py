@@ -113,6 +113,91 @@ def test_api_outage_preserves_pause_clock_and_energy():
     assert unavailable["delivered_kwh"] == paused["delivered_kwh"]
 
 
+def test_incomplete_low_power_sample_starts_pause_clock_without_energy_update():
+    start = datetime(2026, 10, 1, 14, 28, tzinfo=TZ)
+    request = {"id": "ev-1", "required_ac_kwh": 7.0}
+    active = ev_session.update_session({}, now=start, wallbox=_wallbox(2119, 6.72), active_ev_request=request)
+
+    paused = ev_session.update_session(
+        active,
+        now=start + timedelta(minutes=5),
+        wallbox={
+            "available": True,
+            "charging_power_w": 9.9,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+    )
+
+    assert paused["state"] == "PAUSED"
+    assert paused["measurement_available"] is False
+    assert paused["measurement_error"] == "wallbox chargedata power/energy is incomplete"
+    assert paused["current_power_w"] == 9.9
+    assert paused["low_power_since"] == "2026-10-01T14:33:00+02:00"
+    assert paused["delivered_kwh"] == 6.72
+
+
+def test_incomplete_low_power_sample_closes_after_gap_with_last_known_energy():
+    start = datetime(2026, 10, 1, 14, 28, tzinfo=TZ)
+    request = {"id": "ev-1", "required_ac_kwh": 7.0}
+    active = ev_session.update_session({}, now=start, wallbox=_wallbox(2119, 6.72), active_ev_request=request)
+    paused = ev_session.update_session(
+        active,
+        now=start + timedelta(minutes=5),
+        wallbox={
+            "available": True,
+            "charging_power_w": 9.9,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+    )
+
+    closed = ev_session.update_session(
+        paused,
+        now=start + timedelta(minutes=36),
+        wallbox={
+            "available": True,
+            "charging_power_w": 9.9,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+    )
+
+    assert closed["state"] == "CLOSED"
+    assert closed["closed_at"] == "2026-10-01T15:04:00+02:00"
+    assert closed["delivered_kwh"] == 6.72
+    assert closed["final_deviation_kwh"] == -0.28
+    assert closed["replan_required"] is True
+    assert closed["replan_reason"] == "EV_SESSION_CLOSED"
+    assert closed["closure_power_source"] == "incomplete_wallbox_power"
+
+
+def test_incomplete_active_power_keeps_session_active_without_energy_update():
+    start = datetime(2026, 10, 1, 14, 28, tzinfo=TZ)
+    active = ev_session.update_session({}, now=start, wallbox=_wallbox(2119, 6.72))
+
+    still_active = ev_session.update_session(
+        active,
+        now=start + timedelta(minutes=5),
+        wallbox={
+            "available": True,
+            "charging_power_w": 1800.0,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+    )
+
+    assert still_active["state"] == "ACTIVE"
+    assert still_active["current_power_w"] == 1800.0
+    assert still_active["last_active_at"] == "2026-10-01T14:33:00+02:00"
+    assert still_active["low_power_since"] is None
+    assert still_active["delivered_kwh"] == 6.72
+
+
 def test_replan_claim_is_idempotent():
     now = datetime(2026, 8, 7, 12, 0, tzinfo=TZ)
     tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_session_"))

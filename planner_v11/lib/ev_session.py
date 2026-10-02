@@ -1,8 +1,10 @@
 """Persistent physical EV charging-session state machine.
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 Changelog:
+- v1.4 (2026-10-02): Close existing EV sessions after prolonged below-threshold
+  wallbox power even when the energy counter is temporarily incomplete.
 - v1.3 (2026-09-25): Do not bootstrap new EV sessions from below-threshold
   wallbox power samples; completed requests are persisted separately.
 - v1.2 (2026-09-04): Request a replan on every EV session close; executor may
@@ -25,7 +27,7 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.3"
+VERSION = "1.4"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
@@ -224,6 +226,33 @@ def _update_energy(state: dict[str, Any], wallbox: dict[str, Any]) -> None:
     state["physical_remaining_to_max_kwh"] = round(max(0.0, MAX_SESSION_KWH - delivered), 3)
 
 
+
+def _advance_low_power_session(state: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    """Pause or close an existing session after continuous below-threshold power."""
+
+    low_since = _parse_datetime(state.get("low_power_since"), now)
+    if low_since is None:
+        low_since = now
+        state["low_power_since"] = _iso(now)
+        state["paused_at"] = _iso(now)
+    if now - low_since <= timedelta(minutes=SESSION_END_GAP_MINUTES):
+        state["state"] = "PAUSED"
+        state["window_locked"] = True
+        return state
+
+    state["state"] = "CLOSED"
+    state["closed_at"] = _iso(now)
+    state["window_locked"] = False
+    delivered = max(0.0, _float(state.get("delivered_kwh")))
+    target = max(0.0, _float(state.get("effective_target_kwh")))
+    deviation = round(delivered - target, 3)
+    state["final_deviation_kwh"] = deviation
+    state["replan_required"] = True
+    state["replan_reason"] = "EV_SESSION_CLOSED_DEVIATION" if abs(deviation) >= REPLAN_DEVIATION_KWH else "EV_SESSION_CLOSED"
+    state["replan_claimed_at"] = None
+    return state
+
+
 def update_session(
     previous: dict[str, Any] | None,
     *,
@@ -260,6 +289,22 @@ def update_session(
             wallbox.get("error")
             or "wallbox chargedata power/energy is incomplete"
         )
+        power_available = wallbox.get("available") and wallbox.get("charging_power_w") is not None
+        if power_available:
+            power_w = max(0.0, _float(wallbox.get("charging_power_w")))
+            state["current_power_w"] = round(power_w, 1)
+            state["updated_at"] = _iso(now)
+            if old_state in ACTIVE_STATES and power_w <= ACTIVE_POWER_THRESHOLD_W:
+                state["closure_power_source"] = "incomplete_wallbox_power"
+                return _advance_low_power_session(state, now=now)
+            if power_w > ACTIVE_POWER_THRESHOLD_W:
+                state["state"] = "ACTIVE"
+                state["last_active_at"] = _iso(now)
+                state["low_power_since"] = None
+                state["paused_at"] = None
+                state["closed_at"] = None
+                state["window_locked"] = True
+            return state
         state["current_power_w"] = None
         state["updated_at"] = _iso(now)
         return state
@@ -302,27 +347,7 @@ def update_session(
         state["window_locked"] = True
         return state
 
-    low_since = _parse_datetime(state.get("low_power_since"), now)
-    if low_since is None:
-        low_since = now
-        state["low_power_since"] = _iso(now)
-        state["paused_at"] = _iso(now)
-    if now - low_since <= timedelta(minutes=SESSION_END_GAP_MINUTES):
-        state["state"] = "PAUSED"
-        state["window_locked"] = True
-        return state
-
-    state["state"] = "CLOSED"
-    state["closed_at"] = _iso(now)
-    state["window_locked"] = False
-    delivered = max(0.0, _float(state.get("delivered_kwh")))
-    target = max(0.0, _float(state.get("effective_target_kwh")))
-    deviation = round(delivered - target, 3)
-    state["final_deviation_kwh"] = deviation
-    state["replan_required"] = True
-    state["replan_reason"] = "EV_SESSION_CLOSED_DEVIATION" if abs(deviation) >= REPLAN_DEVIATION_KWH else "EV_SESSION_CLOSED"
-    state["replan_claimed_at"] = None
-    return state
+    return _advance_low_power_session(state, now=now)
 
 
 def update_persisted_session(
