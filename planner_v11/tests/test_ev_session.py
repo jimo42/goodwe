@@ -138,6 +138,31 @@ def test_incomplete_low_power_sample_starts_pause_clock_without_energy_update():
     assert paused["delivered_kwh"] == 6.72
 
 
+def test_incomplete_idle_power_sample_uses_twenty_watt_threshold():
+    start = datetime(2026, 10, 1, 14, 28, tzinfo=TZ)
+    request = {"id": "ev-1", "required_ac_kwh": 7.0}
+    active = ev_session.update_session({}, now=start, wallbox=_wallbox(2119, 6.72), active_ev_request=request)
+
+    paused = ev_session.update_session(
+        active,
+        now=start + timedelta(minutes=5),
+        wallbox={
+            "available": True,
+            "charging_power_w": 10.6,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+    )
+
+    assert ev_session.ACTIVE_POWER_THRESHOLD_W == 20.0
+    assert paused["state"] == "PAUSED"
+    assert paused["measurement_available"] is False
+    assert paused["current_power_w"] == 10.6
+    assert paused["low_power_since"] == "2026-10-01T14:33:00+02:00"
+    assert paused["delivered_kwh"] == 6.72
+
+
 def test_incomplete_low_power_sample_closes_after_gap_with_last_known_energy():
     start = datetime(2026, 10, 1, 14, 28, tzinfo=TZ)
     request = {"id": "ev-1", "required_ac_kwh": 7.0}
@@ -173,6 +198,40 @@ def test_incomplete_low_power_sample_closes_after_gap_with_last_known_energy():
     assert closed["replan_required"] is True
     assert closed["replan_reason"] == "EV_SESSION_CLOSED"
     assert closed["closure_power_source"] == "incomplete_wallbox_power"
+
+
+def test_closed_session_stays_closed_on_incomplete_idle_wallbox_power():
+    now = datetime(2026, 10, 2, 12, 30, tzinfo=TZ)
+    previous = {
+        "session_id": "ev-old",
+        "state": "CLOSED",
+        "request_id": "old-request",
+        "delivered_kwh": 6.72,
+        "closed_at": "2026-10-01T15:04:00+02:00",
+        "current_power_w": 0.0,
+    }
+
+    state = ev_session.update_session(
+        previous,
+        now=now,
+        wallbox={
+            "available": True,
+            "charging_power_w": 10.6,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+        active_ev_request={"id": "new-request", "required_ac_kwh": 9.0},
+    )
+
+    assert state["state"] == "CLOSED"
+    assert state["closed_at"] == "2026-10-01T15:04:00+02:00"
+    assert state["request_id"] == "old-request"
+    assert state["measurement_available"] is False
+    assert state["measurement_error"] == "wallbox chargedata power/energy is incomplete"
+    assert state["measurement_source"] == "l1_current_voltage"
+    assert state["current_power_w"] == 10.6
+    assert state["updated_at"] == "2026-10-02T12:30:00+02:00"
 
 
 def test_incomplete_active_power_keeps_session_active_without_energy_update():

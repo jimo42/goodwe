@@ -941,7 +941,7 @@ def test_ev_schedule_change_skips_missing_baseline_start_infeasible_and_inactive
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_active_ev_session_mostly_completed_suppresses_new_future_ev_window():
+def test_unrelated_active_ev_session_does_not_suppress_new_future_ev_window():
     cfg = _cfg({"system": {"horizon_hours": 48}})
     starts = [datetime(2026, 9, 19, 14, 15) + timedelta(minutes=15 * i) for i in range(192)]
     opt_slots = [
@@ -964,14 +964,16 @@ def test_active_ev_session_mostly_completed_suppresses_new_future_ev_window():
         [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session, now=starts[0]
     )
 
-    assert ev_req is None
+    assert ev_req is not None
+    assert ev_req.required_ac_kwh == 9.0
     ev_summary = next(item for item in summary if item.get("id") == "new-ev")
-    assert ev_summary["window_locked"] is True
-    assert ev_summary["mostly_completed_by_active_session"] is True
+    assert ev_summary.get("window_locked") is not True
+    assert ev_summary.get("mostly_completed_by_active_session", False) is False
     assert ev_summary["delivered_kwh"] == 0.0
     assert ev_summary["request_remaining_kwh"] == 9.0
-    assert ev_summary["recommendation"]["recommended_start"] is None
-    assert "více než dvě třetiny" in ev_summary["recommendation"]["reason"]
+    assert ev_summary["recommendation"]["recommended_start"] is not None
+    assert "více než dvě třetiny" not in ev_summary["recommendation"]["reason"]
+    assert ev_summary["ignored_session_request_id"] == "old-ev"
 
 
 def test_active_ev_session_locks_current_window_and_reserves_to_physical_max():
@@ -1032,6 +1034,74 @@ def test_closed_ev_shortfall_below_two_kwh_is_tolerated_not_replanned():
     ev_summary = next(item for item in summary if item.get("id") == "ev-user")
     assert ev_summary["closure_shortfall_tolerated"] is True
     assert ev_summary["actual_request_shortfall_kwh"] == 0.1
+
+
+def test_unrelated_active_ev_session_does_not_complete_new_request():
+    cfg = _cfg({"system": {"horizon_hours": 4}})
+    starts = [datetime(2026, 10, 2, 13, 0) + timedelta(minutes=15 * i) for i in range(16)]
+    opt_slots = [optimizer.SlotInput(dt, 1.0, 0.0, True, False, 0.0, 0.1) for dt in starts]
+    request = {
+        "id": "new-request",
+        "request_id": "new-request",
+        "type": "ev_charge",
+        "required_ac_kwh": 9.0,
+        "available_from": starts[0],
+        "deadline": starts[-1] + timedelta(minutes=15),
+    }
+    session = {
+        "session_id": "ev-old",
+        "state": "ACTIVE",
+        "request_id": "old-request",
+        "delivered_kwh": 6.72,
+        "current_power_w": 10.6,
+    }
+
+    ev_req, _boiler, summary = planner.choose_requests(
+        [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session
+    )
+
+    assert ev_req is not None
+    assert ev_req.required_ac_kwh == 9.0
+    ev_summary = next(item for item in summary if item.get("id") == "new-request")
+    assert ev_summary.get("mostly_completed_by_active_session", False) is False
+    assert ev_summary["delivered_kwh"] == 0.0
+    assert ev_summary["request_remaining_kwh"] == 9.0
+    assert ev_summary["recommendation"]["recommended_start"] is not None
+    assert "Probíhající fyzické nabíjení" not in ev_summary["recommendation"]["reason"]
+    assert ev_summary["ignored_session_request_id"] == "old-request"
+
+
+def test_same_request_active_ev_session_still_locks_current_window():
+    cfg = _cfg({"system": {"horizon_hours": 4}})
+    starts = [datetime(2026, 10, 2, 13, 0) + timedelta(minutes=15 * i) for i in range(16)]
+    opt_slots = [optimizer.SlotInput(dt, 1.0, 0.0, True, False, 0.0, 0.1) for dt in starts]
+    request = {
+        "id": "same-request",
+        "request_id": "same-request",
+        "type": "ev_charge",
+        "required_ac_kwh": 9.0,
+        "available_from": starts[0],
+        "deadline": starts[-1] + timedelta(minutes=15),
+    }
+    session = {
+        "session_id": "ev-current",
+        "state": "ACTIVE",
+        "request_id": "same-request",
+        "delivered_kwh": 6.72,
+        "current_power_w": 2500.0,
+    }
+
+    ev_req, _boiler, summary = planner.choose_requests(
+        [request], starts, cfg, opt_slots, 7.0, 0.0, ev_session_state=session
+    )
+
+    assert ev_req is None
+    ev_summary = next(item for item in summary if item.get("id") == "same-request")
+    assert ev_summary["window_locked"] is True
+    assert ev_summary["session_request_id"] == "same-request"
+    assert ev_summary["delivered_kwh"] == 6.72
+    assert ev_summary["planning_remaining_to_physical_max_kwh"] == 0.0
+    assert "Probíhající fyzická relace" in ev_summary["recommendation"]["reason"]
 
 def test_config_battery_enabled_defaults_true_and_can_be_disabled():
     with open(CONFIG_PATH, "rb") as f:

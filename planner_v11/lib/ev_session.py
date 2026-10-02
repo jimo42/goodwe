@@ -1,8 +1,10 @@
 """Persistent physical EV charging-session state machine.
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 Changelog:
+- v1.5 (2026-10-02): Raise EV active-power threshold to 20 W and keep already
+  closed sessions closed when wallbox energy measurements are incomplete.
 - v1.4 (2026-10-02): Close existing EV sessions after prolonged below-threshold
   wallbox power even when the energy counter is temporarily incomplete.
 - v1.3 (2026-09-25): Do not bootstrap new EV sessions from below-threshold
@@ -27,12 +29,12 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
 SYNTHETIC_TARGET_KWH = 6.0
-ACTIVE_POWER_THRESHOLD_W = 10.0
+ACTIVE_POWER_THRESHOLD_W = 20.0
 SESSION_END_GAP_MINUTES = 30.0
 REPLAN_DEVIATION_KWH = 2.0
 
@@ -294,6 +296,8 @@ def update_session(
             power_w = max(0.0, _float(wallbox.get("charging_power_w")))
             state["current_power_w"] = round(power_w, 1)
             state["updated_at"] = _iso(now)
+            if old_state == "CLOSED":
+                return state
             if old_state in ACTIVE_STATES and power_w <= ACTIVE_POWER_THRESHOLD_W:
                 state["closure_power_source"] = "incomplete_wallbox_power"
                 return _advance_low_power_session(state, now=now)

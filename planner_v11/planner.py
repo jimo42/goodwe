@@ -703,6 +703,7 @@ def choose_requests(
             raw_remaining = round(max(0.0, effective_target - delivered), 3)
             mostly_completed_by_active_session = (
                 session_status in ev_session.ACTIVE_STATES
+                and session_request_id == req_id
                 and effective_target > 0.0
                 and physical_session_delivered > effective_target * EV_REPLAN_SKIP_COMPLETION_FRACTION
             )
