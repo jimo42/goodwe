@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v3.2 (2026-10-05): Report EV completion alerts as shortfall when the
+  closed session still misses a significant amount, and mark requests complete
+  using the same tolerated-shortfall threshold as planner.
 - v3.1 (2026-09-04): Split significant SoC deviation thresholds (+20/-10),
   alert when planned EV/additional loads are not detected within 15 minutes,
   and replan on EV charge end unless a regular planner run is within ±10 min.
@@ -72,7 +75,7 @@ from lib.config import Config, ConfigError, load_config
 
 
 SCHEMA_VERSION = 10
-VERSION = "3.1"
+VERSION = "3.2"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -2036,9 +2039,17 @@ def send_executor_alerts(
         session_id = ev_charging_session.get("session_id")
         if ev_charging_session.get("state") == "CLOSED" and session_id and not ev_charging_session.get("completion_notification_sent_at"):
             delivered = float(ev_charging_session.get("delivered_kwh", 0.0) or 0.0)
+            target = float(ev_charging_session.get("effective_target_kwh", 0.0) or 0.0)
+            remaining = float(ev_charging_session.get("request_remaining_kwh", 0.0) or 0.0)
+            if target > 0.0:
+                remaining = max(0.0, min(remaining, target - delivered))
+            if remaining > 0.05:
+                message = f"Nabíjení auta skončilo, odebráno {delivered:.1f} kWh z {target:.1f} kWh, zbývá {remaining:.1f} kWh."
+            else:
+                message = f"Auto je nabité, spotřeba {delivered:.1f} kWh."
             outcomes.append(alerting.notify_once(
                 f"executor.ev_session_completed.{session_id}",
-                f"Auto je nabité, spotřeba {delivered:.1f} kWh.",
+                message,
                 cfg=cfg,
                 state_path=alert_state_path,
                 now=now,
@@ -2065,7 +2076,7 @@ def _ev_session_completed_request_id(session_state: dict) -> str | None:
         return None
     if target <= 0.0:
         return None
-    if delivered >= max(0.0, target - 0.05):
+    if target - delivered < ev_session.REPLAN_DEVIATION_KWH:
         return str(request_id)
     return None
 

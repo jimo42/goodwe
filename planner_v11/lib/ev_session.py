@@ -1,8 +1,10 @@
 """Persistent physical EV charging-session state machine.
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 Changelog:
+- v1.6 (2026-10-05): Accumulate EV energy across wallbox counter resets
+  within one physical charging session.
 - v1.5 (2026-10-02): Raise EV active-power threshold to 20 W and keep already
   closed sessions closed when wallbox energy measurements are incomplete.
 - v1.4 (2026-10-02): Close existing EV sessions after prolonged below-threshold
@@ -16,8 +18,9 @@ Changelog:
 - v1.0 (2026-08-07): Track wallbox-backed ACTIVE/PAUSED/CLOSED sessions,
   bind one user or synthetic target, and provide atomic replan claims.
 
-The wallbox session counter is authoritative and already expressed in kWh for
-the current physical charge. No legacy energy correction is applied here.
+The wallbox session counter is authoritative and already expressed in kWh,
+but some wallbox faults can restart that counter while the car resumes within
+the same physical charging session. Such resets are accumulated via an offset.
 """
 from __future__ import annotations
 
@@ -29,7 +32,7 @@ from typing import Any
 from . import request_store
 
 
-VERSION = "1.5"
+VERSION = "1.6"
 SCHEMA_VERSION = 1
 
 MAX_SESSION_KWH = 9.0
@@ -170,6 +173,7 @@ def _start_session(
         "wallbox_counter_start_kwh": round(counter, 3),
         "wallbox_counter_last_kwh": round(counter, 3),
         "wallbox_counter_raw_kwh": round(counter, 3),
+        "wallbox_counter_offset_kwh": 0.0,
         "delivered_kwh": round(delivered, 3),
         "request_credited_kwh": round(min(delivered, target), 3),
         "request_remaining_kwh": round(max(0.0, target - delivered), 3),
@@ -215,13 +219,25 @@ def _start_paused_session(
 def _update_energy(state: dict[str, Any], wallbox: dict[str, Any]) -> None:
     raw_counter = max(0.0, _float(wallbox.get("charging_energy_kwh")))
     previous = max(0.0, _float(state.get("delivered_kwh")))
-    measured = min(raw_counter, MAX_SESSION_KWH)
-    if measured + 0.05 < previous:
+    last_raw = max(0.0, _float(
+        state.get("wallbox_counter_raw_kwh", state.get("wallbox_counter_last_kwh"))
+    ))
+    offset = max(0.0, _float(state.get("wallbox_counter_offset_kwh")))
+
+    if raw_counter + 0.05 < last_raw:
+        # The wallbox restarted its per-charge counter while this logical EV
+        # session was only paused (for example after a wallbox fault/retry).
+        # Keep previously credited energy as an offset and add the new counter
+        # instead of dropping the resumed charging segment.
         state["counter_reset_observed"] = True
+        offset = previous
+
+    measured = min(offset + raw_counter, MAX_SESSION_KWH)
     delivered = max(previous, measured)
     target = min(MAX_SESSION_KWH, max(0.0, _float(state.get("effective_target_kwh"))))
     state["wallbox_counter_last_kwh"] = round(raw_counter, 3)
     state["wallbox_counter_raw_kwh"] = round(raw_counter, 3)
+    state["wallbox_counter_offset_kwh"] = round(offset, 3)
     state["delivered_kwh"] = round(delivered, 3)
     state["request_credited_kwh"] = round(min(delivered, target), 3)
     state["request_remaining_kwh"] = round(max(0.0, target - delivered), 3)

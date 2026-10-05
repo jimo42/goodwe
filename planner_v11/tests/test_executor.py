@@ -399,7 +399,7 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     ledger = executor.boiler_state.empty_state()
     day = executor.boiler_state.today_entry(ledger, now.date())
     day.update({"full_detected_at": now.isoformat(), "estimated_delivered_kwh": 8.24})
-    session = {"state": "CLOSED", "session_id": "ev-test", "delivered_kwh": 7.9}
+    session = {"state": "CLOSED", "session_id": "ev-test", "delivered_kwh": 7.9, "effective_target_kwh": 7.9, "request_remaining_kwh": 0.0}
     calls = []
     original = executor.alerting.notify.send
     executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
@@ -424,6 +424,52 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     assert executor.soc_deviation_alert_message("SOC_DEVIATION_BELOW_27.0_PCT_POINTS") == (
         "FVE ALERT: významná odchylka: SOC je o 27.0 % pod plánem"
     )
+
+
+def test_ev_completion_alert_reports_shortfall_without_claiming_car_is_charged():
+    cfg = _cfg()
+    now = datetime(2026, 10, 5, 16, 43, tzinfo=ZoneInfo(cfg.system.timezone))
+    session = {
+        "state": "CLOSED",
+        "session_id": "ev-short",
+        "delivered_kwh": 6.71,
+        "effective_target_kwh": 9.0,
+        "request_remaining_kwh": 2.29,
+    }
+    calls = []
+    original = executor.alerting.notify.send
+    executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
+    tmp = tempfile.mkdtemp(prefix="planner_v11_ev_shortfall_alert_")
+    try:
+        outcomes = executor.send_executor_alerts(
+            now=now, cfg=cfg, forecast_valid=True, forecast_reasons=[], boiler_decision={},
+            relay_health={"relay_status_ok": True}, detected_loads={}, deviation_detected=False,
+            deviation_reason="SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS",
+            ev_charging_session=session, alert_state_path=Path(tmp) / "alerts.json",
+        )
+    finally:
+        executor.alerting.notify.send = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert len(outcomes) == 1
+    assert calls == ["Nabíjení auta skončilo, odebráno 6.7 kWh z 9.0 kWh, zbývá 2.3 kWh."]
+    assert session["completion_notification_sent_at"] == now.isoformat()
+
+
+def test_ev_closed_session_completion_uses_same_shortfall_tolerance_as_planner():
+    assert executor._ev_session_completed_request_id({
+        "state": "CLOSED",
+        "request_id": "ev-request",
+        "delivered_kwh": 8.53,
+        "effective_target_kwh": 9.0,
+    }) == "ev-request"
+
+    assert executor._ev_session_completed_request_id({
+        "state": "CLOSED",
+        "request_id": "ev-request",
+        "delivered_kwh": 6.71,
+        "effective_target_kwh": 9.0,
+    }) is None
 
 
 def test_planned_load_watch_uses_current_active_window_when_rescheduled_backward():

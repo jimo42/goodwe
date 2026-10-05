@@ -257,6 +257,36 @@ def test_incomplete_active_power_keeps_session_active_without_energy_update():
     assert still_active["delivered_kwh"] == 6.72
 
 
+def test_wallbox_counter_reset_within_paused_session_accumulates_resumed_energy():
+    start = datetime(2026, 10, 5, 14, 28, tzinfo=TZ)
+    request = {"id": "ev-1", "required_ac_kwh": 9.0}
+    active = ev_session.update_session({}, now=start, wallbox=_wallbox(3060, 6.71), active_ev_request=request)
+    paused = ev_session.update_session(
+        active,
+        now=start + timedelta(minutes=5),
+        wallbox={
+            "available": True,
+            "charging_power_w": 10.7,
+            "charging_energy_kwh": None,
+            "source": "l1_current_voltage",
+            "error": None,
+        },
+        active_ev_request=request,
+    )
+
+    resumed = ev_session.update_session(paused, now=start + timedelta(minutes=30), wallbox=_wallbox(3033, 0.10), active_ev_request=request)
+    later = ev_session.update_session(resumed, now=start + timedelta(minutes=95), wallbox=_wallbox(503, 1.82), active_ev_request=request)
+
+    assert resumed["counter_reset_observed"] is True
+    assert resumed["wallbox_counter_offset_kwh"] == 6.71
+    assert resumed["delivered_kwh"] == 6.81
+    assert later["wallbox_counter_offset_kwh"] == 6.71
+    assert later["wallbox_counter_raw_kwh"] == 1.82
+    assert later["delivered_kwh"] == 8.53
+    assert later["request_credited_kwh"] == 8.53
+    assert later["request_remaining_kwh"] == 0.47
+
+
 def test_replan_claim_is_idempotent():
     now = datetime(2026, 8, 7, 12, 0, tzinfo=TZ)
     tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_session_"))
