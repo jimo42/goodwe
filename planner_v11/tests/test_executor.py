@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -399,7 +400,25 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     ledger = executor.boiler_state.empty_state()
     day = executor.boiler_state.today_entry(ledger, now.date())
     day.update({"full_detected_at": now.isoformat(), "estimated_delivered_kwh": 8.24})
-    session = {"state": "CLOSED", "session_id": "ev-test", "delivered_kwh": 7.9, "effective_target_kwh": 7.9, "request_remaining_kwh": 0.0}
+    session = {
+        "state": "CLOSED",
+        "session_id": "ev-test",
+        "delivered_kwh": 7.9,
+        "effective_target_kwh": 7.9,
+        "request_remaining_kwh": 0.0,
+        "started_at": "2026-08-10T15:00:00+02:00",
+        "closed_at": "2026-08-10T16:00:00+02:00",
+    }
+    forecast = {
+        "slots": [{
+            "slot_start": "2026-08-10T15:00:00+02:00",
+            "ev_load_kwh": 7.9,
+            "pv_estimate_kwh": 1.0,
+            "fixed_load_kwh": 0.2,
+            "grid_import_kwh": 7.1,
+            "import_price_czk_kwh": 6.0,
+        }],
+    }
     calls = []
     original = executor.alerting.notify.send
     executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
@@ -409,18 +428,23 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
             now=now, cfg=cfg, forecast_valid=True, forecast_reasons=[], boiler_decision={},
             relay_health={"relay_status_ok": True}, detected_loads={}, deviation_detected=False,
             deviation_reason="SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS", boiler_ledger=ledger,
-            ev_charging_session=session, alert_state_path=Path(tmp) / "alerts.json",
+            ev_charging_session=session, forecast_doc=forecast, alert_state_path=Path(tmp) / "alerts.json",
+            ev_completion_log_path=Path(tmp) / "ev_completion.jsonl",
         )
+        completion_lines = (Path(tmp) / "ev_completion.jsonl").read_text(encoding="utf-8").splitlines()
     finally:
         executor.alerting.notify.send = original
         shutil.rmtree(tmp, ignore_errors=True)
     assert len(outcomes) == 2
     assert calls == [
         "Bojler je nahřátý naplno, dnes spotřeboval zhruba 8.2 kWh.",
-        "Auto je nabité, spotřeba 7.9 kWh.",
+        "Auto je nabité, spotřeba 7.9 kWh. Cena 43 Kč.",
     ]
     assert day["full_notification_sent_at"] == now.isoformat()
     assert session["completion_notification_sent_at"] == now.isoformat()
+    assert session["estimated_cost_czk"] == 43
+    assert len(completion_lines) == 1
+    assert json.loads(completion_lines[0])["message"] == "Auto je nabité, spotřeba 7.9 kWh. Cena 43 Kč."
     assert executor.soc_deviation_alert_message("SOC_DEVIATION_BELOW_27.0_PCT_POINTS") == (
         "FVE ALERT: významná odchylka: SOC je o 27.0 % pod plánem"
     )
@@ -435,7 +459,17 @@ def test_ev_completion_alert_reports_shortfall_without_claiming_car_is_charged()
         "delivered_kwh": 6.71,
         "effective_target_kwh": 9.0,
         "request_remaining_kwh": 2.29,
+        "started_at": "2026-10-05T15:00:00+02:00",
+        "closed_at": "2026-10-05T16:00:00+02:00",
     }
+    forecast = {"slots": [{
+        "slot_start": "2026-10-05T15:00:00+02:00",
+        "ev_load_kwh": 6.71,
+        "pv_estimate_kwh": 0.0,
+        "fixed_load_kwh": 0.2,
+        "grid_import_kwh": 6.91,
+        "import_price_czk_kwh": 6.4,
+    }]}
     calls = []
     original = executor.alerting.notify.send
     executor.alerting.notify.send = lambda message, **kwargs: calls.append(message) or True
@@ -445,14 +479,15 @@ def test_ev_completion_alert_reports_shortfall_without_claiming_car_is_charged()
             now=now, cfg=cfg, forecast_valid=True, forecast_reasons=[], boiler_decision={},
             relay_health={"relay_status_ok": True}, detected_loads={}, deviation_detected=False,
             deviation_reason="SOC_DEVIATION_OK_ABOVE_0.0_PCT_POINTS",
-            ev_charging_session=session, alert_state_path=Path(tmp) / "alerts.json",
+            ev_charging_session=session, forecast_doc=forecast, alert_state_path=Path(tmp) / "alerts.json",
+            ev_completion_log_path=Path(tmp) / "ev_completion.jsonl",
         )
     finally:
         executor.alerting.notify.send = original
         shutil.rmtree(tmp, ignore_errors=True)
 
     assert len(outcomes) == 1
-    assert calls == ["Nabíjení auta skončilo, odebráno 6.7 kWh z 9.0 kWh, zbývá 2.3 kWh."]
+    assert calls == ["Nabíjení auta skončilo, odebráno 6.7 kWh z 9.0 kWh, zbývá 2.3 kWh. Cena 43 Kč."]
     assert session["completion_notification_sent_at"] == now.isoformat()
 
 

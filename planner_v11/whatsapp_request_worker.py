@@ -437,6 +437,67 @@ def forecast_request(forecast: Any, request_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_ev_grid_kwh(slot: dict[str, Any]) -> float:
+    """Estimate how much planned EV energy is imported from grid in one slot.
+
+    Planned forecast stores aggregate slot flows, not an explicit `grid_to_ev`
+    variable.  For the user-facing estimate we treat PV as free and allocate it
+    to non-EV load first; the remaining EV energy is priced at the slot import
+    tariff.  This keeps the value close to the actual bill while avoiding
+    charging for PV self-consumption.
+    """
+
+    ev_kwh = max(0.0, _float_or_none(slot.get("ev_load_kwh")) or 0.0)
+    if ev_kwh <= 0.0:
+        return 0.0
+    grid_import = max(0.0, _float_or_none(slot.get("grid_import_kwh")) or 0.0)
+    pv = max(0.0, _float_or_none(slot.get("pv_estimate_kwh")) or 0.0)
+    non_ev_load = max(
+        0.0,
+        (_float_or_none(slot.get("fixed_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("pool_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("additional_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("boiler_hard_kwh")) or 0.0)
+        + (_float_or_none(slot.get("boiler_opportunistic_kwh")) or 0.0),
+    )
+    pv_available_for_ev = max(0.0, pv - non_ev_load)
+    estimated_grid_ev = max(0.0, ev_kwh - pv_available_for_ev)
+    return min(ev_kwh, grid_import, estimated_grid_ev)
+
+
+def estimate_ev_planned_cost_czk(forecast: Any, start: Any, end: Any) -> int | None:
+    if not isinstance(forecast, dict) or not start or not end:
+        return None
+    start_dt = parse_optional_dt(start)
+    end_dt = parse_optional_dt(end)
+    if start_dt is None or end_dt is None:
+        return None
+    total = 0.0
+    priced = False
+    for slot in forecast.get("slots", []):
+        if not isinstance(slot, dict):
+            continue
+        slot_start = parse_optional_dt(slot.get("slot_start"))
+        if slot_start is None or not (start_dt <= slot_start < end_dt):
+            continue
+        price = _float_or_none(slot.get("import_price_czk_kwh"))
+        if price is None:
+            continue
+        ev_grid_kwh = _slot_ev_grid_kwh(slot)
+        if ev_grid_kwh <= 0.0:
+            continue
+        total += ev_grid_kwh * price
+        priced = True
+    return int(round(total)) if priced else None
+
+
 def describe_request(item: dict[str, Any], forecast: Any = None) -> str:
     rtype = item.get("type") or "unknown"
     if rtype == "ev_charge":
@@ -623,10 +684,12 @@ def request_planning_reply(store_request: dict[str, Any], forecast: dict[str, An
         end = rec.get("expected_end")
         latest = rec.get("latest_safe_start")
         if rec.get("feasible") and start and end:
+            cost = estimate_ev_planned_cost_czk(forecast, start, end)
+            cost_note = f" (odhadovaná cena: {cost} Kč)" if cost is not None else ""
             return (
                 f"Nabití auta o přibližně {effective:g} kWh do "
                 f"{format_user_datetime(store_request.get('deadline'))} je zahrnuto v novém plánu. "
-                f"Nabíjení nastavte na {format_user_interval(start, end)}. "
+                f"Nabíjení nastavte na {format_user_interval(start, end)}{cost_note}. "
                 f"Nejpozdější bezpečný start je {format_user_datetime(latest)}.{limit_note}"
             )
         reason = rec.get("reason") or "Planner nenašel proveditelné nabíjecí okno."

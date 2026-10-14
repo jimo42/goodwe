@@ -439,9 +439,27 @@ def test_ev_final_confirmation_contains_single_recommended_timeframe():
                 "latest_safe_start": "2026-07-23T04:15:00+02:00",
             },
         }],
+        "slots": [
+            {
+                "slot_start": "2026-07-23T01:00:00+02:00",
+                "ev_load_kwh": 2.0,
+                "pv_estimate_kwh": 1.0,
+                "fixed_load_kwh": 0.2,
+                "grid_import_kwh": 1.2,
+                "import_price_czk_kwh": 5.0,
+            },
+            {
+                "slot_start": "2026-07-23T01:15:00+02:00",
+                "ev_load_kwh": 1.0,
+                "pv_estimate_kwh": 2.0,
+                "fixed_load_kwh": 0.2,
+                "grid_import_kwh": 0.0,
+                "import_price_czk_kwh": 8.0,
+            },
+        ],
     }
     reply = worker.request_planning_reply(request, forecast)
-    assert "Nabíjení nastavte na čtvrtek 23. 7. 2026 01:00–05:00" in reply
+    assert "Nabíjení nastavte na čtvrtek 23. 7. 2026 01:00–05:00 (odhadovaná cena: 6 Kč)" in reply
     assert "Nejpozdější bezpečný start je čtvrtek 23. 7. 2026 04:15" in reply
     assert reply.count("Nabíjení nastavte na") == 1
     assert "+02:00" not in reply

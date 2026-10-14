@@ -84,6 +84,7 @@ DEFAULT_CONFIG_PATH = PLANNER_DIR / "config.toml"
 FORECAST_PATH = STATE_DIR / "forecast_48h.json"
 RUNTIME_STATE_PATH = STATE_DIR / "runtime_state.json"
 STATE_HISTORY_PATH = STATE_DIR / "state_history.jsonl"
+EV_CHARGING_COMPLETION_LOG_PATH = STATE_DIR / "ev_charging_completion_log.jsonl"
 DETECTED_LOADS_PATH = STATE_DIR / "detected_loads.json"
 ALERT_STATE_PATH = STATE_DIR / "alert_state.json"
 ECO_PLAN_STATE_PATH = STATE_DIR / "eco_plan_state.json"
@@ -150,6 +151,102 @@ def read_recent_history(path: Path, max_records: int = 12) -> list[dict]:
         if isinstance(item, dict):
             out.append(item)
     return out
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_ev_grid_kwh(slot: dict) -> float:
+    """Estimate grid-supplied EV kWh in one forecast slot.
+
+    The optimizer output contains aggregate import/export and planned EV load,
+    but not an explicit `grid_to_ev` flow.  For cost reporting we count PV as
+    free and allocate it to non-EV loads first; any EV remainder is priced using
+    the slot import tariff.
+    """
+
+    ev_kwh = max(0.0, _float_or_none(slot.get("ev_load_kwh")) or 0.0)
+    if ev_kwh <= 0.0:
+        return 0.0
+    grid_import = max(0.0, _float_or_none(slot.get("grid_import_kwh")) or 0.0)
+    pv = max(0.0, _float_or_none(slot.get("pv_estimate_kwh")) or 0.0)
+    non_ev_load = max(
+        0.0,
+        (_float_or_none(slot.get("fixed_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("pool_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("additional_load_kwh")) or 0.0)
+        + (_float_or_none(slot.get("boiler_hard_kwh")) or 0.0)
+        + (_float_or_none(slot.get("boiler_opportunistic_kwh")) or 0.0),
+    )
+    pv_available_for_ev = max(0.0, pv - non_ev_load)
+    estimated_grid_ev = max(0.0, ev_kwh - pv_available_for_ev)
+    return min(ev_kwh, grid_import, estimated_grid_ev)
+
+
+def estimate_ev_session_cost_czk(session_state: dict, forecast_doc: Optional[dict], cfg: Config) -> Optional[int]:
+    """Estimate final grid cost of a closed EV session in CZK.
+
+    Prefer the session's accepted window against the current forecast.  If the
+    forecast no longer covers the old session, fall back to the final delivered
+    kWh times the average import price in the accepted window.  The fallback is
+    intentionally approximate, but stable enough for monthly bookkeeping.
+    """
+
+    if not isinstance(session_state, dict) or not isinstance(forecast_doc, dict):
+        return None
+    tz = ZoneInfo(cfg.system.timezone)
+    start = _parse_optional_datetime(session_state.get("started_at") or session_state.get("accepted_window_start"), tz)
+    end = _parse_optional_datetime(session_state.get("closed_at") or session_state.get("last_active_at") or session_state.get("accepted_window_end"), tz)
+    if start is None or end is None or end <= start:
+        return None
+
+    total = 0.0
+    ev_kwh_in_slots = 0.0
+    weighted_price = 0.0
+    weighted_kwh = 0.0
+    for slot in forecast_doc.get("slots", []):
+        if not isinstance(slot, dict):
+            continue
+        slot_start = _parse_optional_datetime(slot.get("slot_start"), tz)
+        if slot_start is None or not (start <= slot_start < end):
+            continue
+        price = _float_or_none(slot.get("import_price_czk_kwh"))
+        if price is None:
+            continue
+        ev_kwh = max(0.0, _float_or_none(slot.get("ev_load_kwh")) or 0.0)
+        if ev_kwh <= 0.0:
+            continue
+        ev_grid_kwh = _slot_ev_grid_kwh(slot)
+        total += ev_grid_kwh * price
+        ev_kwh_in_slots += ev_kwh
+        weighted_price += ev_kwh * price
+        weighted_kwh += ev_kwh
+
+    if ev_kwh_in_slots > 0.0:
+        try:
+            delivered = max(0.0, float(session_state.get("delivered_kwh", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            delivered = 0.0
+        if delivered > 0.0 and abs(delivered - ev_kwh_in_slots) > 0.05:
+            total *= delivered / ev_kwh_in_slots
+        return int(round(total))
+
+    if weighted_kwh > 0.0:
+        delivered = max(0.0, _float_or_none(session_state.get("delivered_kwh")) or 0.0)
+        return int(round(delivered * weighted_price / weighted_kwh))
+    return None
+
+
+def append_ev_completion_log(path: Path, *, now: datetime, message: str, session_state: dict, cost_czk: Optional[int]) -> None:
+    payload = {
+        "ts": now.isoformat(timespec="seconds"),
+        "message": message,
+    }
+    append_jsonl(path, payload)
 
 
 def load_forecast(path: Path = FORECAST_PATH) -> Optional[dict]:
@@ -1926,6 +2023,8 @@ def send_executor_alerts(
     actual_soc: Optional[float] = None,
     boiler_ledger: Optional[dict] = None,
     ev_charging_session: Optional[dict] = None,
+    forecast_doc: Optional[dict] = None,
+    ev_completion_log_path: Path = EV_CHARGING_COMPLETION_LOG_PATH,
     alert_state_path: Path = ALERT_STATE_PATH,
 ) -> list[dict]:
     """Send deduplicated executor-side alerts via notify_admins.sh."""
@@ -2043,10 +2142,12 @@ def send_executor_alerts(
             remaining = float(ev_charging_session.get("request_remaining_kwh", 0.0) or 0.0)
             if target > 0.0:
                 remaining = max(0.0, min(remaining, target - delivered))
+            cost_czk = estimate_ev_session_cost_czk(ev_charging_session, forecast_doc, cfg)
+            cost_suffix = f" Cena {cost_czk} Kč." if cost_czk is not None else ""
             if remaining > 0.05:
-                message = f"Nabíjení auta skončilo, odebráno {delivered:.1f} kWh z {target:.1f} kWh, zbývá {remaining:.1f} kWh."
+                message = f"Nabíjení auta skončilo, odebráno {delivered:.1f} kWh z {target:.1f} kWh, zbývá {remaining:.1f} kWh.{cost_suffix}"
             else:
-                message = f"Auto je nabité, spotřeba {delivered:.1f} kWh."
+                message = f"Auto je nabité, spotřeba {delivered:.1f} kWh.{cost_suffix}"
             outcomes.append(alerting.notify_once(
                 f"executor.ev_session_completed.{session_id}",
                 message,
@@ -2057,6 +2158,14 @@ def send_executor_alerts(
             ))
             if outcomes[-1].get("sent"):
                 ev_charging_session["completion_notification_sent_at"] = now.isoformat()
+                ev_charging_session["estimated_cost_czk"] = cost_czk
+                append_ev_completion_log(
+                    ev_completion_log_path,
+                    now=now,
+                    message=message,
+                    session_state=ev_charging_session,
+                    cost_czk=cost_czk,
+                )
 
     return outcomes
 
@@ -2133,6 +2242,7 @@ def run_executor(
     history_path: Path = STATE_HISTORY_PATH,
     boiler_state_path: Path = BOILER_CONTROL_STATE_PATH,
     ev_session_path: Path = EV_SESSION_STATE_PATH,
+    ev_completion_log_path: Path = EV_CHARGING_COMPLETION_LOG_PATH,
     requests_path: Path = REQUESTS_PATH,
     reports_dir: str = telemetry.paths.GOODWE_REPORTS_DIR,
     verbose: bool = True,
@@ -2297,6 +2407,8 @@ def run_executor(
         actual_soc=live_state.get("battery_soc"),
         boiler_ledger=ledger,
         ev_charging_session=session_state,
+        forecast_doc=forecast_doc,
+        ev_completion_log_path=ev_completion_log_path,
     )
     if isinstance(ledger, dict):
         today = boiler_state.today_entry(ledger, now.date())
@@ -2328,6 +2440,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--forecast", default=str(FORECAST_PATH), help="Cesta k forecast_48h.json")
     parser.add_argument("--runtime", default=str(RUNTIME_STATE_PATH), help="Výstupní runtime_state.json")
     parser.add_argument("--history", default=str(STATE_HISTORY_PATH), help="Append-only state_history.jsonl")
+    parser.add_argument("--ev-completion-log", default=str(EV_CHARGING_COMPLETION_LOG_PATH), help="Append-only log pouze pro ukončení EV nabíjení")
     parser.add_argument("--initial-soc", type=float, default=None, help="Testovací override SoC; přeskočí live GoodWe read")
     parser.add_argument("--verbose", action="store_true", help="Verbose log na stdout")
     return parser.parse_args(argv)
@@ -2375,6 +2488,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         forecast_path=Path(args.forecast),
         runtime_path=Path(args.runtime),
         history_path=Path(args.history),
+        ev_completion_log_path=Path(args.ev_completion_log),
         verbose=args.verbose,
     )
     log("=== executor.py v11 konec ===", verbose=args.verbose)
