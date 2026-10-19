@@ -1133,7 +1133,7 @@ def test_persist_ev_completion_notification_marks_matching_request_completed():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_persist_ev_completion_notification_does_not_complete_shortfall_request():
+def test_persist_ev_completion_notification_continues_material_shortfall_request():
     now = datetime(2026, 9, 24, 3, 13, tzinfo=ZoneInfo("Europe/Prague"))
     tmp = Path(tempfile.mkdtemp(prefix="planner_v11_executor_ev_shortfall_request_"))
     try:
@@ -1167,8 +1167,78 @@ def test_persist_ev_completion_notification_does_not_complete_shortfall_request(
             requests_path=requests_path,
             now=now,
         )
-        request = json_load(requests_path)["requests"][0]
-        assert request["status"] == "active"
-        assert "completed_at" not in request
+        requests = json_load(requests_path)["requests"]
+        request = next(item for item in requests if item["id"] == "ev-1")
+        continuation = next(item for item in requests if item.get("continuation_of") == "ev-1")
+        assert request["status"] == "partially_completed"
+        assert request["completed_kwh"] == 0.01
+        assert continuation["status"] == "active"
+        assert continuation["required_ac_kwh"] == 7.99
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ev_partial_session_creates_continuation_and_second_session_closes_it():
+    now = datetime(2026, 10, 19, 13, 13, tzinfo=ZoneInfo("Europe/Prague"))
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_executor_ev_continuation_"))
+    try:
+        session_path = tmp / "ev_session.json"
+        requests_path = tmp / "requests.json"
+        deadline = "2026-10-20T09:00:00+02:00"
+        executor.request_store.store_request(requests_path, {
+            "id": "ev-1", "request_id": "ev-1", "type": "ev_charge",
+            "status": "active", "required_ac_kwh": 6.0,
+            "requested_ac_kwh_original": 6.0, "deadline": deadline,
+            "source": "whatsapp",
+        }, replace_existing_same_type=True)
+
+        first_session = {
+            "session_id": "ev-session-1", "state": "CLOSED", "request_id": "ev-1",
+            "effective_target_kwh": 6.0, "delivered_kwh": 3.0,
+        }
+        executor.ev_session.write_state(session_path, first_session)
+        executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": True, "key": "executor.ev_session_completed.ev-session-1"}],
+            session_state=first_session, ev_session_path=session_path,
+            requests_path=requests_path, now=now,
+        )
+
+        doc = json_load(requests_path)
+        original = next(item for item in doc["requests"] if item["id"] == "ev-1")
+        continuation = next(item for item in doc["requests"] if item.get("continuation_of") == "ev-1")
+        assert original["status"] == "partially_completed"
+        assert original["completed_kwh"] == 3.0
+        assert continuation["status"] == "active"
+        assert continuation["required_ac_kwh"] == 3.0
+        assert continuation["deadline"] == deadline
+        assert continuation["source"] == "whatsapp"
+
+        # Retrying the first completion cannot create a duplicate continuation.
+        executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": True, "key": "executor.ev_session_completed.ev-session-1"}],
+            session_state=first_session, ev_session_path=session_path,
+            requests_path=requests_path, now=now,
+        )
+        assert len([item for item in json_load(requests_path)["requests"]
+                    if item.get("continuation_of") == "ev-1"]) == 1
+
+        second_session = {
+            "session_id": "ev-session-2", "state": "CLOSED",
+            "request_id": continuation["id"], "effective_target_kwh": 3.0,
+            "delivered_kwh": 4.7,
+        }
+        executor.ev_session.write_state(session_path, second_session)
+        executor.persist_ev_completion_notification_if_sent(
+            alerts=[{"sent": True, "key": "executor.ev_session_completed.ev-session-2"}],
+            session_state=second_session, ev_session_path=session_path,
+            requests_path=requests_path, now=now + timedelta(hours=3),
+        )
+        final_doc = json_load(requests_path)
+        final_continuation = next(item for item in final_doc["requests"]
+                                  if item["id"] == continuation["id"])
+        assert final_continuation["status"] == "completed"
+        assert final_continuation["completed_kwh"] == 4.7
+        assert not [item for item in final_doc["requests"]
+                    if item.get("continuation_of") == continuation["id"]]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

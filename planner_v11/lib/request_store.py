@@ -1,8 +1,12 @@
 """Atomic storage helpers for planner_v10 user requests.
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 Changelog:
+- v1.5 (2026-10-19): Atomically split materially short EV requests into a
+  completed partial request and an idempotent continuation request.
+- v1.5 (2026-10-19): Atomically split materially short EV requests into a
+  completed partial request and an idempotent continuation request.
 - v1.4 (2026-09-25): Add idempotent completion metadata for fulfilled EV
   requests so completed charging is no longer replanned.
 - v1.3 (2026-08-04): Serialize request-store mutations with a file lock and add
@@ -33,7 +37,7 @@ except ImportError:  # pragma: no cover - local Windows test compatibility.
     fcntl = None
 
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 
 @dataclass(frozen=True)
@@ -215,6 +219,128 @@ def complete_request(
             atomic_write_json(path, doc)
             return CompleteResult(True, request_id, "completed")
     return CompleteResult(False, request_id, "not_found")
+
+
+def complete_ev_request_or_create_continuation(
+    path: Path,
+    request_id: str,
+    *,
+    now: datetime,
+    delivered_kwh: float,
+    session_id: str,
+    continuation_request_id: str,
+    minimum_shortfall_kwh: float,
+) -> str:
+    """Close an EV request and atomically create its material remainder."""
+    stamp = now.isoformat(timespec="seconds")
+    delivered = max(0.0, float(delivered_kwh))
+    with request_store_lock(path):
+        doc = read_request_document(path)
+        item = next((entry for entry in doc["requests"] if isinstance(entry, dict)
+                     and request_id in _request_identity(entry)), None)
+        if item is None:
+            return "not_found"
+        if item.get("status", "active") != "active":
+            return f"not_active:{item.get('status', 'active')}"
+        if item.get("type") != "ev_charge":
+            return "not_ev_charge"
+        target = max(0.0, float(item.get("required_ac_kwh", 0.0) or 0.0))
+        remainder = round(max(0.0, target - delivered), 3)
+        partial = remainder >= minimum_shortfall_kwh
+        item["status"] = "partially_completed" if partial else "completed"
+        item["completed_at"] = stamp
+        item["completed_kwh"] = round(delivered, 3)
+        item["completed_by_session_id"] = str(session_id)
+        item["completion_reason"] = (
+            "ev_session_partial_completion" if partial
+            else "ev_session_completion_notification_sent"
+        )
+        if partial:
+            continuation = next((entry for entry in doc["requests"]
+                                 if isinstance(entry, dict)
+                                 and continuation_request_id in _request_identity(entry)), None)
+            if continuation is None:
+                doc["requests"].append({
+                    "id": continuation_request_id,
+                    "request_id": continuation_request_id,
+                    "type": "ev_charge",
+                    "status": "active",
+                    "required_ac_kwh": remainder,
+                    "requested_ac_kwh_original": remainder,
+                    "available_from": stamp,
+                    "created_at": stamp,
+                    "deadline": item.get("deadline"),
+                    "source": item.get("source", "ev_continuation"),
+                    "energy_limited_to_vehicle_max": False,
+                    "continuation_of": request_id,
+                    "previous_session_id": str(session_id),
+                    "previous_session_delivered_kwh": round(delivered, 3),
+                })
+        doc["schema_version"] = 10
+        doc["updated_at"] = stamp
+        atomic_write_json(path, doc)
+        return str(item["status"])
+
+
+def complete_ev_request_or_create_continuation(
+    path: Path,
+    request_id: str,
+    *,
+    now: datetime,
+    delivered_kwh: float,
+    session_id: str,
+    continuation_request_id: str,
+    minimum_shortfall_kwh: float,
+) -> str:
+    """Close an EV request and atomically create its material remainder."""
+    stamp = now.isoformat(timespec="seconds")
+    delivered = max(0.0, float(delivered_kwh))
+    with request_store_lock(path):
+        doc = read_request_document(path)
+        item = next((entry for entry in doc["requests"] if isinstance(entry, dict)
+                     and request_id in _request_identity(entry)), None)
+        if item is None:
+            return "not_found"
+        if item.get("status", "active") != "active":
+            return f"not_active:{item.get('status', 'active')}"
+        if item.get("type") != "ev_charge":
+            return "not_ev_charge"
+        target = max(0.0, float(item.get("required_ac_kwh", 0.0) or 0.0))
+        remainder = round(max(0.0, target - delivered), 3)
+        partial = remainder >= minimum_shortfall_kwh
+        item["status"] = "partially_completed" if partial else "completed"
+        item["completed_at"] = stamp
+        item["completed_kwh"] = round(delivered, 3)
+        item["completed_by_session_id"] = str(session_id)
+        item["completion_reason"] = (
+            "ev_session_partial_completion" if partial
+            else "ev_session_completion_notification_sent"
+        )
+        if partial:
+            continuation = next((entry for entry in doc["requests"]
+                                 if isinstance(entry, dict)
+                                 and continuation_request_id in _request_identity(entry)), None)
+            if continuation is None:
+                doc["requests"].append({
+                    "id": continuation_request_id,
+                    "request_id": continuation_request_id,
+                    "type": "ev_charge",
+                    "status": "active",
+                    "required_ac_kwh": remainder,
+                    "requested_ac_kwh_original": remainder,
+                    "available_from": stamp,
+                    "created_at": stamp,
+                    "deadline": item.get("deadline"),
+                    "source": item.get("source", "ev_continuation"),
+                    "energy_limited_to_vehicle_max": False,
+                    "continuation_of": request_id,
+                    "previous_session_id": str(session_id),
+                    "previous_session_delivered_kwh": round(delivered, 3),
+                })
+        doc["schema_version"] = 10
+        doc["updated_at"] = stamp
+        atomic_write_json(path, doc)
+        return str(item["status"])
 
 
 def request_is_expired(item: dict[str, Any], *, now: datetime) -> bool:

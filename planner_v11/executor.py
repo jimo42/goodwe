@@ -20,6 +20,8 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v3.3 (2026-10-19): Atomically create an idempotent continuation request
+  when an EV session leaves a material request shortfall.
 - v3.2 (2026-10-05): Report EV completion alerts as shortfall when the
   closed session still misses a significant amount, and mark requests complete
   using the same tolerated-shortfall threshold as planner.
@@ -2198,7 +2200,7 @@ def persist_ev_completion_notification_if_sent(
     now: datetime,
     requests_path: Path = REQUESTS_PATH,
 ) -> dict:
-    """Persist EV completion notification time and complete the matching request."""
+    """Persist EV completion notification time and close/continue the matching request."""
 
     completion_alert_sent = any(
         isinstance(outcome, dict)
@@ -2207,15 +2209,17 @@ def persist_ev_completion_notification_if_sent(
         for outcome in alerts
     )
     if completion_alert_sent and session_state.get("session_id"):
-        request_id = _ev_session_completed_request_id(session_state)
-        if request_id:
-            request_store.complete_request(
+        request_id = session_state.get("request_id")
+        if request_id and not str(request_id).startswith("synthetic:"):
+            session_id = str(session_state["session_id"])
+            request_store.complete_ev_request_or_create_continuation(
                 requests_path,
-                request_id,
+                str(request_id),
                 now=now,
-                completed_kwh=float(session_state.get("delivered_kwh", 0.0) or 0.0),
-                session_id=str(session_state["session_id"]),
-                reason="ev_session_completion_notification_sent",
+                delivered_kwh=float(session_state.get("delivered_kwh", 0.0) or 0.0),
+                session_id=session_id,
+                continuation_request_id=f"{request_id}:continuation:{session_id}",
+                minimum_shortfall_kwh=ev_session.REPLAN_DEVIATION_KWH,
             )
         return ev_session.mark_completion_notification_sent(
             ev_session_path,
