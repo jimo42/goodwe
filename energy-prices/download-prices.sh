@@ -1,4 +1,6 @@
 #!/bin/bash
+VERSION="1.1"
+# v1.1 (2026-10-19): Request next-day prices from 13:00 local time.
 set -u
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" >/dev/null 2>&1; pwd )
@@ -124,6 +126,7 @@ get_file(){
     return 1
 }
 
+log "download-prices.sh version=$VERSION"
 log "$(date)"
 
 TODAY=$(date "+%Y-%m-%d" --date "today")
@@ -141,10 +144,10 @@ then
     log "Tomorrow's primary file exists and is valid."
 else
     log "Tomorrow's primary file missing or invalid."
-    if [ "$(date +"%H")" -ge 14 ]
+    if [ "$(date +"%H")" -ge 13 ]
     then
         get_file "$TOMORROW"
     else
-        log "Tomorrow prices are not requested before 14:00 local time."
+        log "Tomorrow prices are not requested before 13:00 local time."
     fi
 fi

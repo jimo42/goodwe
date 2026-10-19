@@ -1,0 +1,49 @@
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# m h  dom mon dow   command
+
+*/20 6-23 * * * /home/automatization/goodwe/relatka/protoc_cerpadlo.sh 3 >> /home/automatization/goodwe/logs/relatka-cronlog.log 2>&1
+05 6 * * 1-5 /home/automatization/goodwe/relatka/protoc_cerpadlo.sh 10 >> /home/automatization/goodwe/logs/relatka-cronlog.log 2>&1
+45 7 * * 6-7 /home/automatization/goodwe/relatka/protoc_cerpadlo.sh 10 >> /home/automatization/goodwe/logs/relatka-cronlog.log 2>&1
+
+# kazdou ctvrthodinu testujeme, jestli se nemaji vypnout pretoky
+*/5 * * * *     /home/automatization/goodwe/energy-prices/check-power-out.sh  >> /home/automatization/goodwe/logs/check-power-out.log
+
+# stahovani novych cen (na den dopredu)
+7 * * * *       sleep 30; /home/automatization/goodwe/energy-prices/download-prices.sh >> /home/automatization/goodwe/logs/download-prices.log
+
+# update pocasi (na dva dny dopredu)
+55 * * * *      /home/automatization/goodwe/weather-forecast/download-weather.py >> /home/automatization/goodwe/logs/weather.log
+
+# kazdych pet minut testujeme, jestli se nema zapnout bojler (ale jen mezi 11-16h a jen od dubna do rijna)
+# disabled by executor_v11 production takeover 2026-08-02: legacy boiler controller conflicts with production boiler writes
+#*/5 11-17 * 4-10 *      /home/automatization/goodwe/relatka/ovladac_bojleru_automaticky.sh
+
+#0  13 * * *    /home/automatization/goodwe/relatka/ovladac_relatek.sh 2 on
+#1  13 * * *    /home/automatization/goodwe/relatka/ovladac_relatek.sh 3 on
+#39 13 * * *    /home/automatization/goodwe/relatka/ovladac_relatek.sh c on
+
+1 18 * * *      /home/automatization/goodwe/relatka/ovladac_relatek.sh 1 off
+2 18 * * *      /home/automatization/goodwe/relatka/ovladac_relatek.sh 2 off
+3 18 * * *      /home/automatization/goodwe/relatka/ovladac_relatek.sh 3 off
+4 18 * * *      /home/automatization/goodwe/relatka/ovladac_relatek.sh c off
+
+
+# kazdou minutu stahneme data z goodwecka a tarujeme po mesicich starsi reporty
+* * * * *       cd /home/automatization/goodwe/goodwe && ./get_data.sh
+# docasne sbirame i plna data stridace, pro analyzu
+* * * * *	cd /home/automatization/goodwe/goodwe && ./get_data_full.sh
+30 4 1 * *	cd /home/automatization/goodwe/goodwe && ./housekeeping.sh
+
+# planner_v11 - production MILP planner; planner is read-only, executor owns device writes.
+8 * * * *       cd /home/automatization/goodwe/planner_v11; PYTHONDONTWRITEBYTECODE=1 python3 planner.py --verbose >> /home/automatization/goodwe/logs/planner_v11.log 2>&1
+
+# executor_v11 - production tactical layer; config gates are explicitly enabled.
+1-56/5 * * * *  cd /home/automatization/goodwe/planner_v11; PYTHONDONTWRITEBYTECODE=1 python3 executor.py --verbose >> /home/automatization/goodwe/logs/executor_v11.log 2>&1
+
+# whatsapp_request_worker.py - validated WhatsApp spool requests -> planner_v11 state/requests.json
+* * * * *       cd /home/automatization/goodwe/planner_v11; PYTHONDONTWRITEBYTECODE=1 python3 whatsapp_request_worker.py --quiet >> /home/automatization/goodwe/logs/whatsapp_request_worker_v11.log 2>&1
+
+# daily_report.py - two admin notifications: last 24h report + next 24h outlook
+0 7 * * *       cd /home/automatization/goodwe/planner_v11; PYTHONDONTWRITEBYTECODE=1 python3 daily_report.py --send --quiet >> /home/automatization/goodwe/logs/daily_report_v11.log 2>&1

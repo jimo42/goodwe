@@ -1,6 +1,5 @@
 # Secrets and local machine configuration
 conf/
-config/
 config.toml
 **/config.toml
 .env
