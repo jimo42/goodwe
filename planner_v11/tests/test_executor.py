@@ -450,6 +450,102 @@ def test_completion_notifications_are_retry_safe_and_mark_persisted_state():
     )
 
 
+def test_historical_ev_cost_uses_timestamped_samples_and_actual_prices():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_cost_replay_"))
+    history_path = tmp / "history.jsonl"
+    prices_dir = tmp / "prices"
+    prices_dir.mkdir()
+    (prices_dir / "2026-10-23.csv").write_text(
+        "".join(f"{hour:02d}:{minute:02d};100,00\n" for hour in range(24) for minute in range(0, 60, 15)),
+        encoding="utf-8",
+    )
+    stamps = [datetime(2026, 10, 23, 11, 0, tzinfo=tz), datetime(2026, 10, 23, 11, 5, tzinfo=tz)]
+    with history_path.open("w", encoding="utf-8") as handle:
+        for stamp, energy in zip(stamps, (0.0, 0.25)):
+            record = {
+                "ts": stamp.isoformat(),
+                "ev_charging_session": {"session_id": "ev-test-replay"},
+                "detected_loads": {"ev": {"wallbox": {"charging_energy_kwh": energy, "charging_power_w": 3000}}},
+                "live_state": {"house_consumption": 4000, "ppv1": 1000, "ppv2": 1000, "meter_active_power_total": -2000},
+            }
+            handle.write(json.dumps(record) + "\n")
+    session = {
+        "session_id": "ev-test-replay", "started_at": stamps[0].isoformat(),
+        "closed_at": stamps[1].isoformat(), "delivered_kwh": 0.25,
+    }
+    cost = executor.estimate_ev_session_cost_czk(
+        session, None, cfg, history_path=history_path, prices_dir=str(prices_dir),
+    )
+    expected_price = executor.economics.import_cost_czk_per_kwh(100.0, cfg)
+    assert cost == round(0.25 * expected_price)
+    assert executor.estimate_ev_session_cost_czk(
+        session, None, cfg, history_path=history_path, prices_dir=str(prices_dir),
+    ) == cost
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_historical_ev_cost_returns_none_when_samples_or_actual_prices_are_incomplete():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_cost_incomplete_"))
+    history_path = tmp / "history.jsonl"
+    prices_dir = tmp / "prices"
+    prices_dir.mkdir()
+    stamps = [datetime(2026, 10, 23, 11, 0, tzinfo=tz), datetime(2026, 10, 23, 11, 5, tzinfo=tz)]
+    with history_path.open("w", encoding="utf-8") as handle:
+        for stamp, energy in zip(stamps, (0.0, 0.25)):
+            handle.write(json.dumps({
+                "ts": stamp.isoformat(), "ev_charging_session": {"session_id": "ev-test-incomplete"},
+                "detected_loads": {"ev": {"wallbox": {"charging_energy_kwh": energy, "charging_power_w": 3000}}},
+                "live_state": {"house_consumption": 4000, "ppv1": 1000, "ppv2": 1000, "meter_active_power_total": -2000},
+            }) + "\n")
+    session = {
+        "session_id": "ev-test-incomplete", "started_at": stamps[0].isoformat(),
+        "closed_at": stamps[1].isoformat(), "delivered_kwh": 0.25,
+    }
+    try:
+        cost = executor.estimate_ev_session_cost_czk(
+            session, None, cfg, history_path=history_path, prices_dir=str(prices_dir),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert cost is None
+
+
+def test_historical_ev_cost_rejects_large_sampling_gap_during_delivery():
+    cfg = _cfg()
+    tz = ZoneInfo(cfg.system.timezone)
+    tmp = Path(tempfile.mkdtemp(prefix="planner_v11_ev_cost_gap_"))
+    history_path = tmp / "history.jsonl"
+    prices_dir = tmp / "prices"
+    prices_dir.mkdir()
+    (prices_dir / "2026-10-23.csv").write_text(
+        "".join(f"{hour:02d}:{minute:02d};100,00\n" for hour in range(24) for minute in range(0, 60, 15)),
+        encoding="utf-8",
+    )
+    stamps = [datetime(2026, 10, 23, 11, 0, tzinfo=tz), datetime(2026, 10, 23, 11, 15, tzinfo=tz)]
+    with history_path.open("w", encoding="utf-8") as handle:
+        for stamp, energy in zip(stamps, (0.0, 0.75)):
+            handle.write(json.dumps({
+                "ts": stamp.isoformat(), "ev_charging_session": {"session_id": "ev-test-gap"},
+                "detected_loads": {"ev": {"wallbox": {"charging_energy_kwh": energy, "charging_power_w": 3000}}},
+                "live_state": {"house_consumption": 4000, "ppv1": 1000, "ppv2": 1000, "meter_active_power_total": -2000},
+            }) + "\n")
+    session = {
+        "session_id": "ev-test-gap", "started_at": stamps[0].isoformat(),
+        "closed_at": stamps[1].isoformat(), "delivered_kwh": 0.75,
+    }
+    try:
+        cost = executor.estimate_ev_session_cost_czk(
+            session, None, cfg, history_path=history_path, prices_dir=str(prices_dir),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert cost is None
+
+
 def test_ev_completion_alert_reports_shortfall_without_claiming_car_is_charged():
     cfg = _cfg()
     now = datetime(2026, 10, 5, 16, 43, tzinfo=ZoneInfo(cfg.system.timezone))

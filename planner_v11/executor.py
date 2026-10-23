@@ -20,6 +20,9 @@ Autoritativní zdroje:
      realtime ekonomika rozšířit jen při bezpečném fázovém headroomu.
 
 Changelog:
+- v3.4 (2026-10-23): Reconstruct closed EV session grid cost from timestamped
+  wallbox/GoodWe samples and actual historical spot prices when forecast slots
+  no longer cover the session.
 - v3.3 (2026-10-19): Atomically create an idempotent continuation request
   when an EV session leaves a material request shortfall.
 - v3.2 (2026-10-05): Report EV completion alerts as shortfall when the
@@ -74,10 +77,11 @@ from zoneinfo import ZoneInfo
 import planner as planner_module
 from lib import alerting, boiler_state, detectors, economics, ev_session, inverter_client, request_store, telemetry, wallbox_client
 from lib.config import Config, ConfigError, load_config
+from lib import prices as price_data
 
 
 SCHEMA_VERSION = 10
-VERSION = "3.2"
+VERSION = "3.4"
 MODEL_VERSION = "11-executor-v1"
 
 PLANNER_DIR = Path(__file__).resolve().parent
@@ -189,7 +193,111 @@ def _slot_ev_grid_kwh(slot: dict) -> float:
     return min(ev_kwh, grid_import, estimated_grid_ev)
 
 
-def estimate_ev_session_cost_czk(session_state: dict, forecast_doc: Optional[dict], cfg: Config) -> Optional[int]:
+def _historical_ev_session_cost_czk(
+    session_state: dict, cfg: Config, history_path: Path = STATE_HISTORY_PATH,
+    prices_dir: str = price_data.paths.PRICES_DIR,
+) -> Optional[int]:
+    """Reconstruct EV grid cost from persisted wallbox, GoodWe and actual-price samples."""
+    session_id = session_state.get("session_id")
+    delivered = _float_or_none(session_state.get("delivered_kwh"))
+    tz = ZoneInfo(cfg.system.timezone)
+    start = _parse_optional_datetime(session_state.get("started_at"), tz)
+    end = _parse_optional_datetime(
+        session_state.get("closed_at") or session_state.get("last_active_at"), tz,
+    )
+    if not session_id or delivered is None or delivered <= 0 or start is None or end is None or end <= start:
+        return None
+
+    samples: list[tuple[datetime, float, float, float, float, float]] = []
+    try:
+        with open(history_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                session = record.get("ev_charging_session", {})
+                if not isinstance(session, dict) or session.get("session_id") != session_id:
+                    continue
+                wallbox = record.get("detected_loads", {}).get("ev", {}).get("wallbox", {})
+                live = record.get("live_state", {})
+                try:
+                    timestamp = datetime.fromisoformat(record["ts"])
+                    energy = float(wallbox["charging_energy_kwh"])
+                    ev_kw = float(wallbox["charging_power_w"]) / 1000.0
+                    house_kw = float(live["house_consumption"]) / 1000.0
+                    pv_kw = (float(live.get("ppv1", 0) or 0) + float(live.get("ppv2", 0) or 0)) / 1000.0
+                    grid_kw = -float(live["meter_active_power_total"]) / 1000.0
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=tz)
+                timestamp = timestamp.astimezone(tz)
+                if start <= timestamp <= end and energy >= 0 and ev_kw >= 0:
+                    samples.append((timestamp, energy, ev_kw, house_kw, pv_kw, grid_kw))
+    except OSError:
+        return None
+
+    samples.sort(key=lambda sample: sample[0])
+    if len(samples) < 2:
+        return None
+    energy_covered = 0.0
+    cost = 0.0
+    priced_energy = 0.0
+    prices_by_day: dict = {}
+    e = cfg.economics
+    for left, right in zip(samples, samples[1:]):
+        t0, energy0, ev0, house0, pv0, grid0 = left
+        t1, energy1, ev1, house1, pv1, grid1 = right
+        delta = energy1 - energy0
+        elapsed = (t1 - t0).total_seconds()
+        if delta < -0.001 or elapsed <= 0:
+            continue
+        if delta <= 0:
+            continue
+        if elapsed > 10 * 60:
+            return None
+        if delta > 0.5:
+            return None
+        if min(ev0, ev1) < 0.02:
+            if delta <= 0.02:
+                continue
+            return None
+        energy_covered += delta
+        midpoint = t0 + (t1 - t0) / 2
+        day_prices = prices_by_day.get(midpoint.date())
+        if day_prices is None:
+            day_prices = price_data.load_actual_day_prices(midpoint.date(), prices_dir)
+            if day_prices is None:
+                return None
+            prices_by_day[midpoint.date()] = day_prices
+        slot_minute = (midpoint.hour * 60 + midpoint.minute) // 15 * 15
+        spot = day_prices.get(f"{slot_minute // 60:02d}:{slot_minute % 60:02d}")
+        if spot is None:
+            return None
+
+        ev_kw = (ev0 + ev1) / 2
+        other_load_kw = max(0.0, (house0 + house1) / 2 - ev_kw)
+        pv_kw = max(0.0, (pv0 + pv1) / 2)
+        net_import_kw = max(0.0, (grid0 + grid1) / 2)
+        ev_grid_kw = min(ev_kw, max(0.0, net_import_kw - max(0.0, other_load_kw - pv_kw)))
+        grid_kwh = delta * ev_grid_kw / ev_kw if ev_kw > 0 else 0.0
+        import_price = economics.import_cost_czk_per_kwh(spot, cfg)
+        cost += grid_kwh * import_price
+        priced_energy += delta
+
+    # Do not report a partial reconstruction as the price for the full session.
+    tolerance = max(0.15, delivered * 0.03)
+    if abs(energy_covered - delivered) > tolerance or abs(priced_energy - energy_covered) > 0.001:
+        return None
+    return int(round(cost * delivered / energy_covered)) if energy_covered > 0 else None
+
+
+def estimate_ev_session_cost_czk(
+    session_state: dict, forecast_doc: Optional[dict], cfg: Config,
+    history_path: Path = STATE_HISTORY_PATH,
+    prices_dir: str = price_data.paths.PRICES_DIR,
+) -> Optional[int]:
     """Estimate final grid cost of a closed EV session in CZK.
 
     Prefer the session's accepted window against the current forecast.  If the
@@ -198,8 +306,9 @@ def estimate_ev_session_cost_czk(session_state: dict, forecast_doc: Optional[dic
     intentionally approximate, but stable enough for monthly bookkeeping.
     """
 
-    if not isinstance(session_state, dict) or not isinstance(forecast_doc, dict):
+    if not isinstance(session_state, dict):
         return None
+    forecast_slots = forecast_doc.get("slots", []) if isinstance(forecast_doc, dict) else []
     tz = ZoneInfo(cfg.system.timezone)
     start = _parse_optional_datetime(session_state.get("started_at") or session_state.get("accepted_window_start"), tz)
     end = _parse_optional_datetime(session_state.get("closed_at") or session_state.get("last_active_at") or session_state.get("accepted_window_end"), tz)
@@ -210,7 +319,7 @@ def estimate_ev_session_cost_czk(session_state: dict, forecast_doc: Optional[dic
     ev_kwh_in_slots = 0.0
     weighted_price = 0.0
     weighted_kwh = 0.0
-    for slot in forecast_doc.get("slots", []):
+    for slot in forecast_slots:
         if not isinstance(slot, dict):
             continue
         slot_start = _parse_optional_datetime(slot.get("slot_start"), tz)
@@ -240,7 +349,7 @@ def estimate_ev_session_cost_czk(session_state: dict, forecast_doc: Optional[dic
     if weighted_kwh > 0.0:
         delivered = max(0.0, _float_or_none(session_state.get("delivered_kwh")) or 0.0)
         return int(round(delivered * weighted_price / weighted_kwh))
-    return None
+    return _historical_ev_session_cost_czk(session_state, cfg, history_path, prices_dir)
 
 
 def append_ev_completion_log(path: Path, *, now: datetime, message: str, session_state: dict, cost_czk: Optional[int]) -> None:
@@ -2028,6 +2137,7 @@ def send_executor_alerts(
     forecast_doc: Optional[dict] = None,
     ev_completion_log_path: Path = EV_CHARGING_COMPLETION_LOG_PATH,
     alert_state_path: Path = ALERT_STATE_PATH,
+    ev_history_path: Path = STATE_HISTORY_PATH,
 ) -> list[dict]:
     """Send deduplicated executor-side alerts via notify_admins.sh."""
 
@@ -2144,7 +2254,9 @@ def send_executor_alerts(
             remaining = float(ev_charging_session.get("request_remaining_kwh", 0.0) or 0.0)
             if target > 0.0:
                 remaining = max(0.0, min(remaining, target - delivered))
-            cost_czk = estimate_ev_session_cost_czk(ev_charging_session, forecast_doc, cfg)
+            cost_czk = estimate_ev_session_cost_czk(
+                ev_charging_session, forecast_doc, cfg, history_path=ev_history_path,
+            )
             cost_suffix = f" Cena {cost_czk} Kč." if cost_czk is not None else ""
             if remaining > 0.05:
                 message = f"Nabíjení auta skončilo, odebráno {delivered:.1f} kWh z {target:.1f} kWh, zbývá {remaining:.1f} kWh.{cost_suffix}"
@@ -2413,6 +2525,7 @@ def run_executor(
         ev_charging_session=session_state,
         forecast_doc=forecast_doc,
         ev_completion_log_path=ev_completion_log_path,
+        ev_history_path=history_path,
     )
     if isinstance(ledger, dict):
         today = boiler_state.today_entry(ledger, now.date())
